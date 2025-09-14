@@ -435,6 +435,78 @@ export const STATE_TAX_DATA: Record<string, StateTaxInfo> = {
     },
     notes: 'Wyoming has no state income tax',
   },
+
+  UT: {
+    stateName: 'Utah',
+    stateCode: 'UT',
+    hasIncomeTax: true,
+    brackets: {
+      single: [
+        { min: 0, max: Infinity, rate: 0.0485 }, // Flat tax rate (4.85%)
+      ],
+      marriedfilingjointly: [
+        { min: 0, max: Infinity, rate: 0.0485 }, // Flat tax rate (4.85%)
+      ],
+      marriedfilingseparately: [
+        { min: 0, max: Infinity, rate: 0.0485 }, // Flat tax rate (4.85%)
+      ],
+      headofhousehold: [
+        { min: 0, max: Infinity, rate: 0.0485 }, // Flat tax rate (4.85%)
+      ],
+    },
+    standardDeduction: {
+      single: 3100,           // Utah specific standard deduction
+      marriedFilingJointly: 6200,
+      marriedFilingSeparately: 3100,
+      headOfHousehold: 4550,  // Estimated based on Utah tax structure
+    },
+    personalExemption: 1941, // Per dependent
+    notes: 'Utah has a flat 4.85% income tax rate with state-specific standard deductions',
+  },
+
+  AZ: {
+    stateName: 'Arizona',
+    stateCode: 'AZ',
+    hasIncomeTax: true,
+    brackets: {
+      single: [
+        { min: 0, max: 29200, rate: 0.0255 },      // 2.55%
+        { min: 29201, max: 73400, rate: 0.0288 },  // 2.88%
+        { min: 73401, max: 146800, rate: 0.0336 }, // 3.36%
+        { min: 146801, max: 366200, rate: 0.0424 }, // 4.24%
+        { min: 366201, max: Infinity, rate: 0.045 }, // 4.5%
+      ],
+      marriedfilingjointly: [
+        { min: 0, max: 58400, rate: 0.0255 },       // 2.55%
+        { min: 58401, max: 146800, rate: 0.0288 },  // 2.88%
+        { min: 146801, max: 293600, rate: 0.0336 }, // 3.36%
+        { min: 293601, max: 732400, rate: 0.0424 }, // 4.24%
+        { min: 732401, max: Infinity, rate: 0.045 }, // 4.5%
+      ],
+      marriedfilingseparately: [
+        { min: 0, max: 29200, rate: 0.0255 },      // 2.55%
+        { min: 29201, max: 73400, rate: 0.0288 },  // 2.88%
+        { min: 73401, max: 146800, rate: 0.0336 }, // 3.36%
+        { min: 146801, max: 366200, rate: 0.0424 }, // 4.24%
+        { min: 366201, max: Infinity, rate: 0.045 }, // 4.5%
+      ],
+      headofhousehold: [
+        { min: 0, max: 43850, rate: 0.0255 },       // 2.55%
+        { min: 43851, max: 110100, rate: 0.0288 },  // 2.88%
+        { min: 110101, max: 220200, rate: 0.0336 }, // 3.36%
+        { min: 220201, max: 549300, rate: 0.0424 }, // 4.24%
+        { min: 549301, max: Infinity, rate: 0.045 }, // 4.5%
+      ],
+    },
+    standardDeduction: {
+      single: 14600,           // Arizona standard deduction (2024)
+      marriedFilingJointly: 29200,
+      marriedFilingSeparately: 14600,
+      headOfHousehold: 21900,
+    },
+    personalExemption: 2400,   // Per person/dependent
+    notes: 'Arizona has progressive tax brackets ranging from 2.55% to 4.5%',
+  },
 }
 
 // Helper function to get all states with income tax
