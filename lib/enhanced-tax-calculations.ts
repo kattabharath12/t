@@ -1,5 +1,6 @@
 
 import { calculateTaxLiability, getStandardDeduction, TaxCalculationResult, calculateTaxReturn } from './tax-calculations'
+import { calculateCombinedTax, CombinedTaxResult, StateTaxCalculationResult } from './state-tax-calculations'
 
 export interface DeductionComparison {
   standardDeduction: number
@@ -15,6 +16,9 @@ export interface DeductionComparison {
 export interface EnhancedTaxCalculationResult extends TaxCalculationResult {
   deductionComparison: DeductionComparison
   taxOptimizationSuggestions: string[]
+  // State tax integration - NEW
+  stateTax?: StateTaxCalculationResult
+  combinedTaxResult?: CombinedTaxResult
 }
 
 export function calculateDeductionComparison(
@@ -158,6 +162,127 @@ export function calculateEnhancedTaxReturn(data: {
     deductionComparison,
     taxOptimizationSuggestions
   }
+}
+
+// Enhanced tax calculation WITH state tax integration - NEW FUNCTION
+export function calculateEnhancedTaxReturnWithState(data: {
+  totalIncome: number
+  filingStatus: string
+  dependents: any[]
+  itemizedDeductions: number
+  totalWithholdings?: number
+  stateCode?: string
+  stateItemizedDeductions?: number
+}): EnhancedTaxCalculationResult {
+  const { 
+    totalIncome, 
+    filingStatus, 
+    dependents, 
+    itemizedDeductions, 
+    totalWithholdings,
+    stateCode,
+    stateItemizedDeductions 
+  } = data
+  
+  // Get basic federal tax calculation first
+  const federalResult = calculateEnhancedTaxReturn({
+    totalIncome,
+    filingStatus,
+    dependents,
+    itemizedDeductions,
+    totalWithholdings
+  })
+  
+  // If no state code provided, return federal-only result
+  if (!stateCode) {
+    return federalResult
+  }
+  
+  try {
+    // Calculate combined federal + state taxes
+    const combinedTaxResult = calculateCombinedTax({
+      adjustedGrossIncome: federalResult.adjustedGrossIncome,
+      federalTaxableIncome: federalResult.taxableIncome,
+      federalTaxLiability: federalResult.taxLiability,
+      federalEffectiveRate: federalResult.effectiveRate,
+      federalMarginalRate: federalResult.marginalRate,
+      filingStatus,
+      stateCode,
+      stateItemizedDeductions: stateItemizedDeductions || itemizedDeductions,
+      dependents,
+      totalCredits: federalResult.totalCredits,
+      totalWithholdings: federalResult.totalWithholdings
+    })
+    
+    // Update optimization suggestions to include state tax considerations
+    const enhancedSuggestions = generateStateTaxOptimizationSuggestions(
+      federalResult.taxOptimizationSuggestions,
+      combinedTaxResult.stateTax,
+      federalResult.deductionComparison
+    )
+    
+    return {
+      ...federalResult,
+      // Override final calculations with combined results
+      finalTax: combinedTaxResult.finalTax,
+      refundAmount: combinedTaxResult.refundAmount,
+      amountOwed: combinedTaxResult.amountOwed,
+      // Add state tax information
+      stateTax: combinedTaxResult.stateTax,
+      combinedTaxResult,
+      taxOptimizationSuggestions: enhancedSuggestions,
+    }
+    
+  } catch (error) {
+    console.error('State tax calculation error:', error)
+    // Fall back to federal-only result if state calculation fails
+    return {
+      ...federalResult,
+      taxOptimizationSuggestions: [
+        ...federalResult.taxOptimizationSuggestions,
+        `⚠️ State tax calculation failed for ${stateCode}. Showing federal taxes only.`
+      ]
+    }
+  }
+}
+
+// Generate state-specific tax optimization suggestions
+function generateStateTaxOptimizationSuggestions(
+  federalSuggestions: string[],
+  stateTax: StateTaxCalculationResult,
+  deductionComparison: DeductionComparison
+): string[] {
+  const suggestions = [...federalSuggestions]
+  
+  if (!stateTax.hasIncomeTax) {
+    suggestions.unshift(`💰 Great news! ${stateTax.stateName} has no state income tax, saving you money!`)
+    return suggestions
+  }
+  
+  // State tax specific suggestions
+  if (stateTax.stateTaxLiability > 0) {
+    suggestions.push(`📍 ${stateTax.stateName} state tax: $${stateTax.stateTaxLiability.toLocaleString()} (${stateTax.stateEffectiveRate.toFixed(2)}% effective rate)`)
+    
+    // State deduction optimization
+    if (stateTax.stateStandardDeduction > 0 && stateTax.stateItemizedDeduction > stateTax.stateStandardDeduction) {
+      const stateSavings = (stateTax.stateItemizedDeduction - stateTax.stateStandardDeduction) * (stateTax.stateMarginalRate / 100)
+      if (stateSavings > 100) {
+        suggestions.push(`🏛️ Itemizing saves $${stateSavings.toFixed(0)} on ${stateTax.stateName} state taxes`)
+      }
+    }
+    
+    // High state tax warning
+    if (stateTax.stateEffectiveRate > 5) {
+      suggestions.push(`⚡ ${stateTax.stateName} has relatively high state taxes. Consider tax-advantaged retirement contributions.`)
+    }
+  }
+  
+  // Cross-deduction optimization
+  if (stateTax.stateStandardDeduction !== deductionComparison.standardDeduction) {
+    suggestions.push(`🔄 Note: ${stateTax.stateName} has different deduction amounts than federal`)
+  }
+  
+  return suggestions
 }
 
 export function calculateTaxImpactScenarios(
