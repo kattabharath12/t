@@ -1,13 +1,15 @@
 
-
-
 import { NextResponse } from "next/server"
 import { getServerSession } from "next-auth"
 import { authOptions } from "@/lib/auth"
 import { prisma } from "@/lib/db"
-import { DocumentType, ProcessingStatus, EntryType } from "@prisma/client"
-import { getAzureDocumentIntelligenceService, type ExtractedFieldData } from "@/lib/azure-document-intelligence-service"
-import { DuplicateDetectionService, type DuplicateDetectionResult } from "@/lib/duplicate-detection"
+import { AzureDocumentIntelligenceService } from "@/lib/azure-document-intelligence-service"
+import { detectStateFromDocument } from "@/lib/state-detection"
+import { W2ToForm1040Mapper } from "@/lib/w2-to-1040-mapping"
+import { Form1099ToForm1040Mapper } from "@/lib/1099-to-1040-mapping"
+import { DuplicateDetectionService } from "@/lib/duplicate-detection"
+import { calculateEnhancedTaxReturnWithState } from "@/lib/enhanced-tax-calculations"
+import { DocumentType, ProcessingStatus, IncomeType } from "@prisma/client"
 
 export const dynamic = "force-dynamic"
 
@@ -15,771 +17,623 @@ export async function POST(
   request: Request,
   { params }: { params: { id: string } }
 ) {
-  console.log("🔍 [PROCESS] Starting document processing for ID:", params.id)
+  console.log("🔍 [PROCESS] Starting comprehensive document processing for ID:", params.id)
   
   try {
-    console.log("🔍 [PROCESS] Step 1: Getting server session...")
+    console.log("🔍 [PROCESS] Step 1: Authentication and user verification...")
     const session = await getServerSession(authOptions)
     
-    if (!session?.user?.id) {
-      console.log("❌ [PROCESS] No valid session found")
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+    if (!session?.user?.email) {
+      console.log("❌ [PROCESS] No session or email found")
+      return NextResponse.json({ 
+        error: "Authentication required. Please log in to process documents." 
+      }, { status: 401 })
     }
-    
-    console.log("✅ [PROCESS] Session validated for user:", session.user.id)
+    console.log("✅ [PROCESS] Session found for email:", session.user.email)
 
-    console.log("🔍 [PROCESS] Step 2: Fetching document from database...")
-    const document = await prisma.document.findUnique({
-      where: { id: params.id },
+    console.log("🔍 [PROCESS] Step 2: Database verification and document lookup...")
+    const user = await prisma.user.findUnique({
+      where: { email: session.user.email }
+    })
+
+    if (!user) {
+      console.log("❌ [PROCESS] User not found in database")
+      return NextResponse.json({ 
+        error: "User not found. Please contact support." 
+      }, { status: 404 })
+    }
+
+    const document = await prisma.document.findFirst({
+      where: { 
+        id: params.id,
+        taxReturn: { userId: user.id }
+      },
       include: {
         taxReturn: {
-          select: {
-            userId: true
+          include: {
+            documents: {
+              where: {
+                processingStatus: 'COMPLETED'
+              }
+            },
+            incomeEntries: true,
+            dependents: true
           }
         }
       }
     })
 
     if (!document) {
-      console.log("❌ [PROCESS] Document not found")
-      return NextResponse.json({ error: "Document not found" }, { status: 404 })
+      console.log("❌ [PROCESS] Document not found or not owned by user")
+      return NextResponse.json({ 
+        error: "Document not found or access denied" 
+      }, { status: 404 })
     }
+    console.log("✅ [PROCESS] Document found:", document.id, "Type:", document.documentType)
 
-    if (document.taxReturn.userId !== session.user.id) {
-      console.log("❌ [PROCESS] Document does not belong to user")
-      return NextResponse.json({ error: "Unauthorized" }, { status: 403 })
-    }
-
-    console.log("✅ [PROCESS] Document found:", {
-      id: document.id,
-      fileName: document.fileName,
-      documentType: document.documentType,
-      processingStatus: document.processingStatus
-    })
-
-    console.log("🔍 [PROCESS] Step 3: Checking if document is already processed...")
+    console.log("🔍 [PROCESS] Step 3: Processing status validation...")
     if (document.processingStatus === 'COMPLETED') {
-      console.log("ℹ️ [PROCESS] Document already processed, returning existing data")
+      console.log("✅ [PROCESS] Document already processed, returning comprehensive data")
       
-      const existingEntries = await prisma.documentExtractedEntry.findMany({
-        where: { documentId: document.id }
-      })
-      
-      return NextResponse.json({
-        success: true,
-        message: "Document already processed",
-        data: {
-          documentId: document.id,
-          documentType: document.documentType,
-          extractedData: document.extractedData, // Include raw extracted data for frontend processing
-          extractedEntries: existingEntries,
-          ocrText: document.ocrText,
-          confidence: 0.95 // Default confidence for already processed documents
-        }
-      })
-    }
-
-    console.log("🔍 [PROCESS] Step 4: Updating processing status to PROCESSING...")
-    await prisma.document.update({
-      where: { id: params.id },
-      data: { processingStatus: ProcessingStatus.PROCESSING }
-    })
-    console.log("✅ [PROCESS] Processing status updated")
-
-    console.log("🔍 [PROCESS] Step 5: Checking Azure Document Intelligence configuration...")
-    const azureEndpoint = process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT
-    const azureApiKey = process.env.AZURE_DOCUMENT_INTELLIGENCE_API_KEY
-
-    if (!azureEndpoint || !azureApiKey) {
-      console.log("❌ [PROCESS] Azure Document Intelligence not configured")
-      await prisma.document.update({
-        where: { id: params.id },
-        data: { processingStatus: ProcessingStatus.FAILED }
-      })
-      return NextResponse.json({ 
-        error: "Azure Document Intelligence service not configured" 
-      }, { status: 500 })
-    }
-    
-    console.log("✅ [PROCESS] Azure Document Intelligence configured")
-
-    console.log("🔍 [PROCESS] Step 6: Processing with Azure Document Intelligence...")
-    let extractedTaxData: any;
-    let finalDocumentType = document.documentType;
-    
-    try {
-      const azureService = getAzureDocumentIntelligenceService();
-      const extractedData = await azureService.extractDataFromDocument(document.filePath, document.documentType);
-      
-      // Check if document type was corrected based on OCR analysis
-      if (extractedData.correctedDocumentType) {
-        console.log(`🔄 [PROCESS] Document type corrected: ${document.documentType} → ${extractedData.correctedDocumentType}`);
+      // Return comprehensive data including state tax information
+      const responseData = {
+        documentId: document.id,
+        extractedData: document.extractedData,
+        ocrText: document.ocrText,
+        processingStatus: document.processingStatus,
+        documentType: document.documentType,
+        fileName: document.fileName,
         
-        // Convert string to DocumentType enum with validation
-        const correctedType = extractedData.correctedDocumentType as string;
-        if (Object.values(DocumentType).includes(correctedType as DocumentType)) {
-          finalDocumentType = correctedType as DocumentType;
-          
-          // Update the document type in the database
-          await prisma.document.update({
-            where: { id: params.id },
-            data: { documentType: finalDocumentType }
-          });
-          console.log("✅ [PROCESS] Document type updated in database");
-        } else {
-          console.log(`⚠️ [PROCESS] Invalid document type returned: ${correctedType}, keeping original: ${document.documentType}`);
-        }
+        // State detection results
+        detectedState: document.taxReturn.detectedState,
+        stateConfidence: document.taxReturn.stateConfidence,
+        stateSource: document.taxReturn.stateSource,
+        
+        // Tax calculation results
+        taxCalculations: {
+          totalIncome: parseFloat(document.taxReturn.totalIncome.toString()),
+          adjustedGrossIncome: parseFloat(document.taxReturn.adjustedGrossIncome.toString()),
+          taxableIncome: parseFloat(document.taxReturn.taxableIncome.toString()),
+          taxLiability: parseFloat(document.taxReturn.taxLiability.toString()),
+          stateTaxLiability: parseFloat(document.taxReturn.stateTaxLiability.toString()),
+          refundAmount: parseFloat(document.taxReturn.refundAmount.toString()),
+          amountOwed: parseFloat(document.taxReturn.amountOwed.toString())
+        },
+        
+        // Processing metadata
+        createdAt: document.createdAt,
+        updatedAt: document.updatedAt
       }
-      
-      extractedTaxData = {
-        documentType: finalDocumentType,
-        ocrText: extractedData.fullText || '',
-        extractedData: extractedData,
-        confidence: 0.95 // Azure typically has high confidence
-      };
-      
-      console.log("✅ [PROCESS] Final document type:", finalDocumentType)
-      console.log("✅ [PROCESS] Azure Document Intelligence processing completed")
-    } catch (azureError: any) {
-      console.error("❌ [PROCESS] Azure Document Intelligence processing failed:", azureError)
-      await prisma.document.update({
-        where: { id: params.id },
-        data: { processingStatus: ProcessingStatus.FAILED }
-      })
-      return NextResponse.json({ 
-        error: `Document processing failed: ${azureError?.message || 'Unknown error'}` 
-      }, { status: 500 })
+
+      return NextResponse.json(responseData)
     }
 
-    console.log("🔍 [PROCESS] Step 7: Checking for duplicate documents...")
-    let duplicateInfo: DuplicateDetectionResult | null = null;
+    if (document.processingStatus === 'PROCESSING') {
+      console.log("⚠️ [PROCESS] Document is already being processed")
+      return NextResponse.json({ 
+        error: "Document is currently being processed. Please wait and try again." 
+      }, { status: 409 })
+    }
+
+    console.log("🔍 [PROCESS] Step 4: Setting processing status...")
+    await prisma.document.update({
+      where: { id: document.id },
+      data: { 
+        processingStatus: 'PROCESSING',
+        updatedAt: new Date()
+      }
+    })
+
+    console.log("🔍 [PROCESS] Step 5: Azure Document Intelligence configuration...")
+    const azureConfig = {
+      endpoint: process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT!,
+      apiKey: process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY!
+    }
+
+    if (!azureConfig.endpoint || !azureConfig.apiKey) {
+      throw new Error("Azure Document Intelligence credentials not configured. Please contact support.")
+    }
+
+    console.log("🔍 [PROCESS] Step 6: Initializing Azure Document Intelligence service...")
+    const azureService = new AzureDocumentIntelligenceService(azureConfig)
+
+    console.log("🔍 [PROCESS] Step 7: Extracting document data with Azure DI...")
+    let extractedData
+    try {
+      extractedData = await azureService.extractDataFromDocument(
+        document.filePath,
+        document.documentType
+      )
+      console.log("✅ [PROCESS] Document extraction completed successfully")
+      
+      // Log extraction results for debugging
+      if (process.env.NODE_ENV === 'development') {
+        console.log("🔍 [PROCESS] Extracted data summary:", {
+          hasFullText: !!extractedData.fullText,
+          fieldCount: Object.keys(extractedData).length,
+          documentTypeCorrection: extractedData.correctedDocumentType,
+          mainFields: Object.keys(extractedData).filter(key => 
+            !['fullText', 'correctedDocumentType'].includes(key)
+          ).slice(0, 10)
+        })
+      }
+    } catch (extractionError: any) {
+      console.error("❌ [PROCESS] Document extraction failed:", extractionError)
+      throw new Error(`Document extraction failed: ${extractionError.message}`)
+    }
+
+    console.log("🔍 [PROCESS] Step 8: Document type validation and correction...")
+    let finalDocumentType = document.documentType
+    
+    if (extractedData.correctedDocumentType) {
+      console.log("🔄 [PROCESS] Document type correction detected:", 
+        document.documentType, "→", extractedData.correctedDocumentType)
+      
+      // Update document type in database
+      await prisma.document.update({
+        where: { id: document.id },
+        data: { documentType: extractedData.correctedDocumentType }
+      })
+      finalDocumentType = extractedData.correctedDocumentType
+    }
+
+    console.log("🔍 [PROCESS] Step 9: State detection and analysis...")
+    let stateDetectionResult = null
+    let detectedStateCode = null
     
     try {
-      duplicateInfo = await DuplicateDetectionService.checkForDuplicates({
+      stateDetectionResult = await detectStateFromDocument({
         documentType: finalDocumentType,
-        extractedData: extractedTaxData.extractedData,
-        taxReturnId: document.taxReturnId
-      });
+        extractedData
+      })
       
-      if (duplicateInfo.isDuplicate) {
-        console.log("⚠️ [PROCESS] Duplicate document detected:", duplicateInfo);
+      if (stateDetectionResult?.detectedState) {
+        detectedStateCode = stateDetectionResult.detectedState
+        console.log("✅ [PROCESS] State detection completed:", {
+          state: detectedStateCode,
+          confidence: stateDetectionResult.confidence,
+          source: stateDetectionResult.source
+        })
       } else {
-        console.log("✅ [PROCESS] No duplicates found");
+        console.log("⚠️ [PROCESS] State detection completed but no state found")
+      }
+    } catch (stateError: any) {
+      console.error("⚠️ [PROCESS] State detection failed:", stateError)
+      // Continue processing even if state detection fails
+    }
+
+    console.log("🔍 [PROCESS] Step 10: Duplicate detection analysis...")
+    let duplicateCheckResult = null
+    
+    try {
+      duplicateCheckResult = await DuplicateDetectionService.checkForDuplicates({
+        documentType: finalDocumentType,
+        extractedData,
+        taxReturnId: document.taxReturnId
+      })
+      
+      if (duplicateCheckResult.isDuplicate) {
+        console.log("⚠️ [PROCESS] Potential duplicate detected:", {
+          confidence: duplicateCheckResult.confidence,
+          matchingDocuments: duplicateCheckResult.matchingDocuments.length
+        })
+      } else {
+        console.log("✅ [PROCESS] No duplicates detected")
       }
     } catch (duplicateError: any) {
-      console.error("❌ [PROCESS] Duplicate detection failed:", duplicateError);
+      console.error("⚠️ [PROCESS] Duplicate detection failed:", duplicateError)
       // Continue processing even if duplicate detection fails
-      duplicateInfo = { 
-        isDuplicate: false, 
-        confidence: 0, 
-        matchingDocuments: [],
-        matchCriteria: {
-          documentType: false,
-          employerInfo: false,
-          recipientInfo: false,
-          amountSimilarity: false,
-          nameSimilarity: false
-        }
-      };
     }
 
-    console.log("🔍 [PROCESS] Step 8: Extracting structured data...")
-    const extractedEntries: any[] = [];
+    console.log("🔍 [PROCESS] Step 11: Form 1040 data mapping...")
+    let form1040Mapping = null
+    let updatedTaxReturnData = {}
     
     try {
-      // Process different document types
-      switch (finalDocumentType) {
-        case 'W2':
-          console.log("🔍 [PROCESS] Processing W2 document...")
-          const w2Entries = await processW2Document(extractedTaxData.extractedData);
-          extractedEntries.push(...w2Entries);
-          break;
-          
-        case 'FORM_1099_INT':
-          console.log("🔍 [PROCESS] Processing 1099-INT document...")
-          const intEntries = await process1099IntDocument(extractedTaxData.extractedData);
-          extractedEntries.push(...intEntries);
-          break;
-          
-        case 'FORM_1099_DIV':
-          console.log("🔍 [PROCESS] Processing 1099-DIV document...")
-          const divEntries = await process1099DivDocument(extractedTaxData.extractedData);
-          extractedEntries.push(...divEntries);
-          break;
-          
-        case 'FORM_1099_MISC':
-          console.log("🔍 [PROCESS] Processing 1099-MISC document...")
-          const miscEntries = await process1099MiscDocument(extractedTaxData.extractedData);
-          extractedEntries.push(...miscEntries);
-          break;
-          
-        case 'FORM_1099_NEC':
-          console.log("🔍 [PROCESS] Processing 1099-NEC document...")
-          const necEntries = await process1099NecDocument(extractedTaxData.extractedData);
-          extractedEntries.push(...necEntries);
-          break;
-          
-        default:
-          console.log("🔍 [PROCESS] Processing generic document...")
-          const genericEntries = await processGenericDocument(extractedTaxData.extractedData);
-          extractedEntries.push(...genericEntries);
-          break;
-      }
-      
-      console.log(`✅ [PROCESS] Extracted ${extractedEntries.length} entries`)
-    } catch (extractionError: any) {
-      console.error("❌ [PROCESS] Data extraction failed:", extractionError);
-      await prisma.document.update({
-        where: { id: params.id },
-        data: { processingStatus: ProcessingStatus.FAILED }
+      // Get current tax return data
+      const currentTaxReturn = await prisma.taxReturn.findUnique({
+        where: { id: document.taxReturnId },
+        include: { dependents: true }
       })
-      return NextResponse.json({ 
-        error: `Data extraction failed: ${extractionError?.message || 'Unknown error'}` 
-      }, { status: 500 })
-    }
 
-    console.log("🔍 [PROCESS] Step 9: Saving extracted entries to database...")
-    try {
-      // Save extracted entries to database
-      const savedEntries = await Promise.all(
-        extractedEntries.map(entry => 
-          prisma.documentExtractedEntry.create({
+      if (!currentTaxReturn) {
+        throw new Error("Tax return not found for Form 1040 mapping")
+      }
+
+      // Map document data to Form 1040
+      if (finalDocumentType === 'W2') {
+        console.log("🔍 [PROCESS] Mapping W2 data to Form 1040...")
+        form1040Mapping = W2ToForm1040Mapper.mapW2ToForm1040(extractedData)
+        
+        // Create income entry for W2
+        const wagesAmount = parseAmount(extractedData.wages) || 0
+        const federalTaxWithheld = parseAmount(extractedData.federalTaxWithheld) || 0
+        
+        if (wagesAmount > 0) {
+          await prisma.incomeEntry.create({
             data: {
+              taxReturnId: document.taxReturnId,
               documentId: document.id,
-              entryType: finalDocumentType === 'W2' ? EntryType.INCOME : EntryType.INCOME, // Default to INCOME for now
-              extractedData: {
-                fieldName: entry.fieldName,
-                fieldValue: entry.fieldValue,
-                confidence: entry.confidence || 0.95,
-                boundingBox: entry.boundingBox || null
-              }
+              incomeType: 'W2_WAGES',
+              description: `W2 wages from ${extractedData.employerName || 'Employer'}`,
+              amount: wagesAmount,
+              employerName: String(extractedData.employerName || ''),
+              employerEIN: String(extractedData.employerEIN || ''),
+              federalTaxWithheld: federalTaxWithheld
             }
           })
-        )
-      );
+        }
+        
+      } else if (finalDocumentType.startsWith('FORM_1099')) {
+        console.log("🔍 [PROCESS] Mapping 1099 data to Form 1040...")
+        form1040Mapping = Form1099ToForm1040Mapper.map1099ToForm1040(extractedData)
+        
+        // Create income entry for 1099
+        const incomeAmount = getIncomeAmountFromForm1099(extractedData, finalDocumentType)
+        if (incomeAmount > 0) {
+          const incomeType = mapDocumentTypeToIncomeType(finalDocumentType)
+          
+          await prisma.incomeEntry.create({
+            data: {
+              taxReturnId: document.taxReturnId,
+              documentId: document.id,
+              incomeType,
+              description: `${finalDocumentType} income from ${extractedData.payerName || 'Payer'}`,
+              amount: incomeAmount,
+              payerName: String(extractedData.payerName || ''),
+              payerTIN: String(extractedData.payerTIN || '')
+            }
+          })
+        }
+      }
+
+      // Update tax return with mapped data
+      if (form1040Mapping) {
+        updatedTaxReturnData = {
+          firstName: form1040Mapping.firstName || currentTaxReturn.firstName,
+          lastName: form1040Mapping.lastName || currentTaxReturn.lastName,
+          ssn: form1040Mapping.ssn || currentTaxReturn.ssn,
+          address: form1040Mapping.address || currentTaxReturn.address,
+          city: form1040Mapping.city || currentTaxReturn.city,
+          state: form1040Mapping.state || currentTaxReturn.state,
+          zipCode: form1040Mapping.zipCode || currentTaxReturn.zipCode
+        }
+      }
+
+      console.log("✅ [PROCESS] Form 1040 mapping completed")
+    } catch (mappingError: any) {
+      console.error("⚠️ [PROCESS] Form 1040 mapping failed:", mappingError)
+      // Continue processing even if mapping fails
+    }
+
+    console.log("🔍 [PROCESS] Step 12: Tax calculations with state tax integration...")
+    let taxCalculationResult = null
+    
+    try {
+      // Recalculate all income entries for this tax return
+      const allIncomeEntries = await prisma.incomeEntry.findMany({
+        where: { taxReturnId: document.taxReturnId }
+      })
       
-      console.log(`✅ [PROCESS] Saved ${savedEntries.length} entries to database`)
-    } catch (saveError: any) {
-      console.error("❌ [PROCESS] Failed to save entries:", saveError);
+      const totalIncome = allIncomeEntries.reduce((sum, entry) => 
+        sum + parseFloat(entry.amount.toString()), 0)
+      
+      // Get dependents for credit calculations
+      const dependents = await prisma.dependent.findMany({
+        where: { taxReturnId: document.taxReturnId }
+      })
+
+      // Perform enhanced tax calculation with state tax integration
+      const taxData = {
+        totalIncome,
+        filingStatus: document.taxReturn.filingStatus,
+        dependents: dependents,
+        itemizedDeductions: parseFloat(document.taxReturn.itemizedDeduction.toString()),
+        totalWithholdings: parseFloat(document.taxReturn.totalWithholdings.toString()),
+        stateCode: detectedStateCode || undefined,
+        stateItemizedDeductions: parseFloat(document.taxReturn.stateItemizedDeduction.toString())
+      }
+
+      taxCalculationResult = calculateEnhancedTaxReturnWithState(taxData)
+      console.log("✅ [PROCESS] Tax calculations completed:", {
+        federalTax: taxCalculationResult.taxLiability,
+        stateTax: taxCalculationResult.stateTax?.stateTaxLiability || 0,
+        totalTax: taxCalculationResult.combinedTaxResult?.totalTaxLiability || taxCalculationResult.taxLiability
+      })
+      
+      // Update tax calculation fields
+      updatedTaxReturnData = {
+        ...updatedTaxReturnData,
+        totalIncome,
+        adjustedGrossIncome: taxCalculationResult.adjustedGrossIncome,
+        standardDeduction: taxCalculationResult.standardDeduction,
+        itemizedDeduction: taxCalculationResult.itemizedDeduction,
+        taxableIncome: taxCalculationResult.taxableIncome,
+        taxLiability: taxCalculationResult.taxLiability,
+        totalCredits: taxCalculationResult.totalCredits,
+        totalWithholdings: taxCalculationResult.totalWithholdings,
+        refundAmount: taxCalculationResult.refundAmount,
+        amountOwed: taxCalculationResult.amountOwed,
+        
+        // State tax fields
+        stateTaxLiability: taxCalculationResult.stateTax?.stateTaxLiability || 0,
+        stateStandardDeduction: taxCalculationResult.stateTax?.stateStandardDeduction || 0,
+        stateTaxableIncome: taxCalculationResult.stateTax?.stateTaxableIncome || 0,
+        stateEffectiveRate: taxCalculationResult.stateTax?.stateEffectiveRate || 0
+      }
+      
+    } catch (calculationError: any) {
+      console.error("⚠️ [PROCESS] Tax calculation failed:", calculationError)
+      // Continue processing even if tax calculation fails
+    }
+
+    console.log("🔍 [PROCESS] Step 13: Database updates and persistence...")
+    
+    try {
+      // Update document with processing results
+      const updatedDocument = await prisma.document.update({
+        where: { id: document.id },
+        data: {
+          processingStatus: 'COMPLETED' as ProcessingStatus,
+          ocrText: extractedData.fullText || null,
+          extractedData: extractedData,
+          documentType: finalDocumentType,
+          isVerified: false, // Requires manual verification
+          updatedAt: new Date()
+        }
+      })
+
+      // Update tax return with comprehensive data
+      let taxReturnUpdateData: any = {
+        ...updatedTaxReturnData,
+        lastSavedAt: new Date(),
+        updatedAt: new Date()
+      }
+
+      // Add state detection results if available
+      if (stateDetectionResult?.detectedState) {
+        const stateSource = mapStateDetectionSourceToEnum(stateDetectionResult.source)
+        taxReturnUpdateData = {
+          ...taxReturnUpdateData,
+          detectedState: stateDetectionResult.detectedState,
+          stateConfidence: stateDetectionResult.confidence,
+          stateSource,
+          state: stateDetectionResult.detectedState // Update personal info state field too
+        }
+      }
+
+      const updatedTaxReturn = await prisma.taxReturn.update({
+        where: { id: document.taxReturnId },
+        data: taxReturnUpdateData
+      })
+
+      console.log("✅ [PROCESS] Database updates completed successfully")
+
+      console.log("🎉 [PROCESS] Document processing completed successfully!")
+      
+      // Prepare comprehensive response data
+      const responseData = {
+        // Document information
+        documentId: updatedDocument.id,
+        extractedData: updatedDocument.extractedData,
+        ocrText: updatedDocument.ocrText,
+        processingStatus: updatedDocument.processingStatus,
+        documentType: updatedDocument.documentType,
+        fileName: updatedDocument.fileName,
+        
+        // State detection results
+        detectedState: updatedTaxReturn.detectedState,
+        stateConfidence: updatedTaxReturn.stateConfidence,
+        stateSource: updatedTaxReturn.stateSource,
+        stateDetectionResult,
+        
+        // Tax calculation results
+        taxCalculations: taxCalculationResult,
+        
+        // Form 1040 mapping results
+        form1040Mapping,
+        
+        // Duplicate detection results
+        duplicateCheck: duplicateCheckResult,
+        
+        // Processing metadata
+        processedAt: new Date(),
+        processingTime: Date.now() - new Date(updatedDocument.createdAt).getTime(),
+        
+        // Validation and next steps
+        requiresManualReview: duplicateCheckResult?.isDuplicate || 
+                             (stateDetectionResult?.confidence || 0) < 0.8,
+        suggestedActions: generateSuggestedActions(
+          duplicateCheckResult, 
+          stateDetectionResult, 
+          taxCalculationResult
+        )
+      }
+
+      return NextResponse.json(responseData)
+      
+    } catch (dbError: any) {
+      console.error("❌ [PROCESS] Database update failed:", dbError)
+      throw new Error(`Database update failed: ${dbError.message}`)
+    }
+    
+  } catch (error: any) {
+    console.error("💥 [PROCESS] Document processing error:", error)
+    console.error("💥 [PROCESS] Error stack:", error?.stack)
+
+    // Update document status to failed with error details
+    try {
       await prisma.document.update({
         where: { id: params.id },
-        data: { processingStatus: ProcessingStatus.FAILED }
+        data: { 
+          processingStatus: 'FAILED' as ProcessingStatus,
+          updatedAt: new Date()
+        }
       })
-      return NextResponse.json({ 
-        error: `Failed to save extracted data: ${saveError?.message || 'Unknown error'}` 
+      console.log("✅ [PROCESS] Document status updated to FAILED")
+    } catch (updateError: any) {
+      console.error("💥 [PROCESS] Failed to update document status:", updateError)
+    }
+
+    // Determine error type for better user experience
+    const errorType = categorizeError(error)
+    
+    // Return appropriate error response based on environment and error type
+    if (process.env.NODE_ENV === 'development') {
+      return NextResponse.json({
+        error: "Document processing failed",
+        errorType,
+        details: error?.message || 'Unknown error',
+        stack: error?.stack || 'No stack trace',
+        timestamp: new Date().toISOString()
       }, { status: 500 })
     }
 
-    console.log("🔍 [PROCESS] Step 10: Creating income entries from extracted data...")
-    try {
-      // Automatically create income entries for supported document types
-      await createIncomeEntriesFromExtractedData(finalDocumentType, extractedTaxData.extractedData, document.id, document.taxReturnId);
-      console.log("✅ [PROCESS] Income entries created successfully")
-      
-      // Trigger income aggregation after creating entries
-      await updateIncomeAggregation(document.taxReturnId);
-      console.log("✅ [PROCESS] Income aggregation updated")
-    } catch (incomeError: any) {
-      console.error("❌ [PROCESS] Failed to create income entries:", incomeError);
-      // Don't fail the entire process if income entry creation fails
-      // The extracted data is still saved and can be processed manually
-    }
-
-    console.log("🔍 [PROCESS] Step 11: Updating document status to COMPLETED and saving extractedData...")
-    // CRITICAL FIX: Save the extractedData to the Document model for Form 1040 retrieval
-    await prisma.document.update({
-      where: { id: params.id },
-      data: { 
-        processingStatus: ProcessingStatus.COMPLETED,
-        extractedData: extractedTaxData.extractedData, // This is the key fix!
-        ocrText: extractedTaxData.ocrText
-      }
-    })
-
-    console.log("✅ [PROCESS] Document processing completed successfully")
-    
+    // Production error response
+    const userFriendlyMessage = getUserFriendlyErrorMessage(errorType)
     return NextResponse.json({
-      success: true,
-      message: "Document processed successfully",
-      data: {
-        documentId: document.id,
-        documentType: finalDocumentType,
-        extractedData: extractedTaxData.extractedData, // Include raw extracted data for frontend processing
-        extractedEntries: extractedEntries,
-        duplicateInfo: duplicateInfo,
-        ocrText: extractedTaxData.ocrText,
-        confidence: extractedTaxData.confidence
-      }
-    })
-
-  } catch (error: any) {
-    console.error("❌ [PROCESS] Unexpected error:", error)
-    
-    // Update document status to failed if possible
-    try {
-      await prisma.document.update({
-        where: { id: params.id },
-        data: { processingStatus: ProcessingStatus.FAILED }
-      })
-    } catch (updateError) {
-      console.error("❌ [PROCESS] Failed to update document status:", updateError)
-    }
-    
-    return NextResponse.json({ 
-      error: `Processing failed: ${error?.message || 'Unknown error'}` 
+      error: userFriendlyMessage,
+      errorType,
+      timestamp: new Date().toISOString(),
+      supportReference: `PROC-${Date.now()}`
     }, { status: 500 })
   }
+
 }
 
-// Helper methods for processing different document types
-async function processW2Document(extractedData: ExtractedFieldData): Promise<any[]> {
-    const entries = [];
-    
-    // Map W2 fields to database entries
-    const w2FieldMappings = {
-      'employeeName': 'Employee Name',
-      'employeeSSN': 'Employee SSN',
-      'employeeAddress': 'Employee Address',
-      'employerName': 'Employer Name',
-      'employerEIN': 'Employer EIN',
-      'employerAddress': 'Employer Address',
-      'wages': 'Box 1 - Wages',
-      'federalTaxWithheld': 'Box 2 - Federal Tax Withheld',
-      'socialSecurityWages': 'Box 3 - Social Security Wages',
-      'socialSecurityTaxWithheld': 'Box 4 - Social Security Tax Withheld',
-      'medicareWages': 'Box 5 - Medicare Wages',
-      'medicareTaxWithheld': 'Box 6 - Medicare Tax Withheld',
-      'socialSecurityTips': 'Box 7 - Social Security Tips',
-      'allocatedTips': 'Box 8 - Allocated Tips',
-      'stateWages': 'Box 15 - State Wages',
-      'stateTaxWithheld': 'Box 17 - State Tax Withheld',
-      'localWages': 'Box 18 - Local Wages',
-      'localTaxWithheld': 'Box 19 - Local Tax Withheld'
-    };
-    
-    for (const [fieldKey, displayName] of Object.entries(w2FieldMappings)) {
-      if (extractedData[fieldKey] !== undefined && extractedData[fieldKey] !== null && extractedData[fieldKey] !== '') {
-        entries.push({
-          fieldName: displayName,
-          fieldValue: String(extractedData[fieldKey]),
-          confidence: 0.95
-        });
-      }
-    }
-    
-    return entries;
-  }
-
-async function process1099IntDocument(extractedData: ExtractedFieldData): Promise<any[]> {
-    const entries = [];
-    
-    const fieldMappings = {
-      'payerName': 'Payer Name',
-      'payerTIN': 'Payer TIN',
-      'payerAddress': 'Payer Address',
-      'recipientName': 'Recipient Name',
-      'recipientTIN': 'Recipient TIN',
-      'recipientAddress': 'Recipient Address',
-      'interestIncome': 'Box 1 - Interest Income',
-      'earlyWithdrawalPenalty': 'Box 2 - Early Withdrawal Penalty',
-      'interestOnUSavingsBonds': 'Box 3 - Interest on US Savings Bonds',
-      'federalTaxWithheld': 'Box 4 - Federal Tax Withheld',
-      'investmentExpenses': 'Box 5 - Investment Expenses',
-      'foreignTaxPaid': 'Box 6 - Foreign Tax Paid',
-      'taxExemptInterest': 'Box 8 - Tax-Exempt Interest'
-    };
-    
-    for (const [fieldKey, displayName] of Object.entries(fieldMappings)) {
-      if (extractedData[fieldKey] !== undefined && extractedData[fieldKey] !== null && extractedData[fieldKey] !== '') {
-        entries.push({
-          fieldName: displayName,
-          fieldValue: String(extractedData[fieldKey]),
-          confidence: 0.95
-        });
-      }
-    }
-    
-    return entries;
-  }
-
-async function process1099DivDocument(extractedData: ExtractedFieldData): Promise<any[]> {
-    const entries = [];
-    
-    const fieldMappings = {
-      'payerName': 'Payer Name',
-      'payerTIN': 'Payer TIN',
-      'payerAddress': 'Payer Address',
-      'recipientName': 'Recipient Name',
-      'recipientTIN': 'Recipient TIN',
-      'recipientAddress': 'Recipient Address',
-      'ordinaryDividends': 'Box 1a - Ordinary Dividends',
-      'qualifiedDividends': 'Box 1b - Qualified Dividends',
-      'totalCapitalGain': 'Box 2a - Total Capital Gain Distributions',
-      'nondividendDistributions': 'Box 3 - Nondividend Distributions',
-      'federalTaxWithheld': 'Box 4 - Federal Tax Withheld',
-      'section199ADividends': 'Box 5 - Section 199A Dividends'
-    };
-    
-    for (const [fieldKey, displayName] of Object.entries(fieldMappings)) {
-      if (extractedData[fieldKey] !== undefined && extractedData[fieldKey] !== null && extractedData[fieldKey] !== '') {
-        entries.push({
-          fieldName: displayName,
-          fieldValue: String(extractedData[fieldKey]),
-          confidence: 0.95
-        });
-      }
-    }
-    
-    return entries;
-  }
-
-async function process1099MiscDocument(extractedData: ExtractedFieldData): Promise<any[]> {
-    const entries = [];
-    
-    // Comprehensive field mappings for all 1099-MISC boxes and information
-    const fieldMappings = {
-      // Payer and recipient information
-      'payerName': 'Payer Name',
-      'payerTIN': 'Payer TIN',
-      'payerAddress': 'Payer Address',
-      'recipientName': 'Recipient Name',
-      'recipientTIN': 'Recipient TIN',
-      'recipientAddress': 'Recipient Address',
-      'accountNumber': 'Account Number',
-      
-      // Box 1-18 mappings
-      'rents': 'Box 1 - Rents',
-      'royalties': 'Box 2 - Royalties',
-      'otherIncome': 'Box 3 - Other Income',
-      'federalTaxWithheld': 'Box 4 - Federal Income Tax Withheld',
-      'fishingBoatProceeds': 'Box 5 - Fishing Boat Proceeds',
-      'medicalHealthPayments': 'Box 6 - Medical and Health Care Payments',
-      'nonemployeeCompensation': 'Box 7 - Nonemployee Compensation',
-      'substitutePayments': 'Box 8 - Substitute Payments in Lieu of Dividends or Interest',
-      'cropInsuranceProceeds': 'Box 9 - Crop Insurance Proceeds',
-      'attorneyProceeds': 'Box 10 - Gross Proceeds Paid to an Attorney',
-      'fishPurchases': 'Box 11 - Fish Purchased for Resale',
-      'section409ADeferrals': 'Box 12 - Section 409A Deferrals',
-      'excessGoldenParachutePayments': 'Box 13 - Excess Golden Parachute Payments',
-      'nonqualifiedDeferredCompensation': 'Box 14 - Nonqualified Deferred Compensation',
-      'section409AIncome': 'Box 15a - Section 409A Income',
-      'stateTaxWithheld': 'Box 16 - State Tax Withheld',
-      'statePayerNumber': 'Box 17 - State/Payer\'s State No.',
-      'stateIncome': 'Box 18 - State Income',
-      
-      // Additional fields that might be extracted
-      'medicalPaymentsMultiple': 'Multiple Medical Payments Found'
-    };
-    
-    for (const [fieldKey, displayName] of Object.entries(fieldMappings)) {
-      if (extractedData[fieldKey] !== undefined && extractedData[fieldKey] !== null && extractedData[fieldKey] !== '') {
-        let fieldValue = extractedData[fieldKey];
-        
-        // Handle special cases
-        if (fieldKey === 'medicalPaymentsMultiple' && Array.isArray(fieldValue)) {
-          // Convert array of medical payments to string
-          fieldValue = fieldValue.map(amount => `$${amount}`).join(', ');
-        }
-        
-        entries.push({
-          fieldName: displayName,
-          fieldValue: String(fieldValue),
-          confidence: 0.95
-        });
-      }
-    }
-    
-    return entries;
-  }
-
-async function process1099NecDocument(extractedData: ExtractedFieldData): Promise<any[]> {
-    const entries = [];
-    
-    const fieldMappings = {
-      'payerName': 'Payer Name',
-      'payerTIN': 'Payer TIN',
-      'payerAddress': 'Payer Address',
-      'recipientName': 'Recipient Name',
-      'recipientTIN': 'Recipient TIN',
-      'recipientAddress': 'Recipient Address',
-      'nonemployeeCompensation': 'Box 1 - Nonemployee Compensation',
-      'federalTaxWithheld': 'Box 4 - Federal Tax Withheld'
-    };
-    
-    for (const [fieldKey, displayName] of Object.entries(fieldMappings)) {
-      if (extractedData[fieldKey] !== undefined && extractedData[fieldKey] !== null && extractedData[fieldKey] !== '') {
-        entries.push({
-          fieldName: displayName,
-          fieldValue: String(extractedData[fieldKey]),
-          confidence: 0.95
-        });
-      }
-    }
-    
-    return entries;
-  }
-
-async function processGenericDocument(extractedData: ExtractedFieldData): Promise<any[]> {
-    const entries = [];
-    
-    // Process all available fields for generic documents
-    for (const [fieldKey, fieldValue] of Object.entries(extractedData)) {
-      if (fieldKey !== 'fullText' && fieldKey !== 'correctedDocumentType' && 
-          fieldValue !== undefined && fieldValue !== null && fieldValue !== '') {
-        entries.push({
-          fieldName: fieldKey,
-          fieldValue: String(fieldValue),
-          confidence: 0.85
-        });
-      }
-    }
-    
-    return entries;
-  }
-
-// Function to automatically create income entries from extracted data
-async function createIncomeEntriesFromExtractedData(
-  documentType: string, 
-  extractedData: ExtractedFieldData, 
-  documentId: string, 
-  taxReturnId: string
-): Promise<void> {
-  console.log(`🔍 [INCOME] Creating income entries for ${documentType}...`);
-  
+// Helper function to get income amount from 1099 forms
+function getIncomeAmountFromForm1099(extractedData: any, documentType: string): number {
   switch (documentType) {
-    case 'W2':
-      await createW2IncomeEntries(extractedData, documentId, taxReturnId);
-      break;
-      
     case 'FORM_1099_INT':
-      await create1099IntIncomeEntries(extractedData, documentId, taxReturnId);
-      break;
-      
+      return parseAmount(extractedData.interestIncome) || 0
     case 'FORM_1099_DIV':
-      await create1099DivIncomeEntries(extractedData, documentId, taxReturnId);
-      break;
-      
+      return parseAmount(extractedData.ordinaryDividends) || 0
     case 'FORM_1099_MISC':
-      await create1099MiscIncomeEntries(extractedData, documentId, taxReturnId);
-      break;
-      
+      return Math.max(
+        parseAmount(extractedData.rents) || 0,
+        parseAmount(extractedData.royalties) || 0,
+        parseAmount(extractedData.otherIncome) || 0,
+        parseAmount(extractedData.nonemployeeCompensation) || 0
+      )
     case 'FORM_1099_NEC':
-      await create1099NecIncomeEntries(extractedData, documentId, taxReturnId);
-      break;
-      
+      return parseAmount(extractedData.nonemployeeCompensation) || 0
     default:
-      console.log(`ℹ️ [INCOME] No automatic income entry creation for ${documentType}`);
-      break;
+      return 0
   }
 }
 
-// Create income entries for W2 documents
-async function createW2IncomeEntries(extractedData: ExtractedFieldData, documentId: string, taxReturnId: string): Promise<void> {
-  const wages = parseFloat(String(extractedData.wages || 0));
-  const federalTaxWithheld = parseFloat(String(extractedData.federalTaxWithheld || 0));
-  
-  if (wages > 0) {
-    await prisma.incomeEntry.create({
-      data: {
-        taxReturnId,
-        documentId,
-        incomeType: 'W2_WAGES',
-        description: `W-2 Wages from ${extractedData.employerName || 'Employer'}`,
-        amount: wages,
-        employerName: String(extractedData.employerName || ''),
-        employerEIN: String(extractedData.employerEIN || ''),
-        federalTaxWithheld: federalTaxWithheld
-      }
-    });
-    console.log(`✅ [INCOME] Created W2 wages entry: $${wages.toLocaleString()}`);
+// Helper function to map document type to income type
+function mapDocumentTypeToIncomeType(documentType: string): IncomeType {
+  switch (documentType) {
+    case 'FORM_1099_INT':
+      return 'INTEREST'
+    case 'FORM_1099_DIV':
+      return 'DIVIDENDS'
+    case 'FORM_1099_MISC':
+    case 'FORM_1099_NEC':
+      return 'BUSINESS_INCOME'
+    default:
+      return 'OTHER_INCOME'
   }
 }
 
-// Create income entries for 1099-INT documents
-async function create1099IntIncomeEntries(extractedData: ExtractedFieldData, documentId: string, taxReturnId: string): Promise<void> {
-  const interestIncome = parseFloat(String(extractedData.interestIncome || 0));
-  const interestOnUSavingsBonds = parseFloat(String(extractedData.interestOnUSavingsBonds || 0));
-  const taxExemptInterest = parseFloat(String(extractedData.taxExemptInterest || 0));
-  const federalTaxWithheld = parseFloat(String(extractedData.federalTaxWithheld || 0));
-  
-  // Create entry for taxable interest income (Box 1)
-  if (interestIncome > 0) {
-    await prisma.incomeEntry.create({
-      data: {
-        taxReturnId,
-        documentId,
-        incomeType: 'INTEREST',
-        description: `Interest Income from ${extractedData.payerName || 'Financial Institution'}`,
-        amount: interestIncome,
-        payerName: String(extractedData.payerName || ''),
-        payerTIN: String(extractedData.payerTIN || ''),
-        federalTaxWithheld: federalTaxWithheld
-      }
-    });
-    console.log(`✅ [INCOME] Created 1099-INT interest income entry: $${interestIncome.toLocaleString()}`);
+// Helper function to parse amount values
+function parseAmount(value: any): number {
+  if (value === null || value === undefined) return 0
+  if (typeof value === 'number') return isNaN(value) ? 0 : value
+  if (typeof value === 'string') {
+    const cleaned = value.replace(/[$,\s]/g, '')
+    const parsed = parseFloat(cleaned)
+    return isNaN(parsed) ? 0 : parsed
   }
-  
-  // Create entry for US Savings Bonds interest (Box 3) - this is also taxable
-  if (interestOnUSavingsBonds > 0) {
-    await prisma.incomeEntry.create({
-      data: {
-        taxReturnId,
-        documentId,
-        incomeType: 'INTEREST',
-        description: `US Savings Bonds Interest from ${extractedData.payerName || 'Financial Institution'}`,
-        amount: interestOnUSavingsBonds,
-        payerName: String(extractedData.payerName || ''),
-        payerTIN: String(extractedData.payerTIN || ''),
-        federalTaxWithheld: 0 // US Savings Bonds typically don't have withholding
-      }
-    });
-    console.log(`✅ [INCOME] Created 1099-INT US Savings Bonds entry: $${interestOnUSavingsBonds.toLocaleString()}`);
-  }
-  
-  // Note: Tax-exempt interest (Box 8) is not added to income entries as it's not taxable
-  // but it should be tracked for informational purposes in the tax return
-  if (taxExemptInterest > 0) {
-    console.log(`ℹ️ [INCOME] Tax-exempt interest of $${taxExemptInterest.toLocaleString()} noted but not added to taxable income`);
+  return 0
+}
+
+// Helper function to map state detection source to enum
+function mapStateDetectionSourceToEnum(source: string): 'ADDRESS' | 'EMPLOYER' | 'DOCUMENT_TYPE' | 'MANUAL' | 'UNKNOWN' {
+  switch (source) {
+    case 'address': return 'ADDRESS'
+    case 'employer': return 'EMPLOYER'
+    case 'document_type': return 'DOCUMENT_TYPE'
+    case 'manual': return 'MANUAL'
+    default: return 'UNKNOWN'
   }
 }
 
-// Create income entries for 1099-DIV documents
-async function create1099DivIncomeEntries(extractedData: ExtractedFieldData, documentId: string, taxReturnId: string): Promise<void> {
-  const ordinaryDividends = parseFloat(String(extractedData.ordinaryDividends || 0));
-  const qualifiedDividends = parseFloat(String(extractedData.qualifiedDividends || 0));
-  const federalTaxWithheld = parseFloat(String(extractedData.federalTaxWithheld || 0));
+// Helper function to generate suggested actions
+function generateSuggestedActions(
+  duplicateResult: any, 
+  stateResult: any, 
+  taxResult: any
+): string[] {
+  const actions = []
   
-  if (ordinaryDividends > 0) {
-    await prisma.incomeEntry.create({
-      data: {
-        taxReturnId,
-        documentId,
-        incomeType: 'DIVIDENDS',
-        description: `Dividends from ${extractedData.payerName || 'Investment Company'}`,
-        amount: ordinaryDividends,
-        payerName: String(extractedData.payerName || ''),
-        payerTIN: String(extractedData.payerTIN || ''),
-        federalTaxWithheld: federalTaxWithheld
-      }
-    });
-    console.log(`✅ [INCOME] Created 1099-DIV dividends entry: $${ordinaryDividends.toLocaleString()}`);
+  if (duplicateResult?.isDuplicate) {
+    actions.push("Review potential duplicate documents before proceeding")
   }
+  
+  if ((stateResult?.confidence || 0) < 0.8) {
+    actions.push("Verify state information for accurate tax calculations")
+  }
+  
+  if (taxResult?.taxOptimizationSuggestions?.length > 0) {
+    actions.push("Review tax optimization suggestions to maximize savings")
+  }
+  
+  if (actions.length === 0) {
+    actions.push("Document processed successfully - review extracted data")
+  }
+  
+  return actions
 }
 
-// Create income entries for 1099-MISC documents
-async function create1099MiscIncomeEntries(extractedData: ExtractedFieldData, documentId: string, taxReturnId: string): Promise<void> {
-  const otherIncome = parseFloat(String(extractedData.otherIncome || 0));
-  const rents = parseFloat(String(extractedData.rents || 0));
-  const royalties = parseFloat(String(extractedData.royalties || 0));
-  const federalTaxWithheld = parseFloat(String(extractedData.federalTaxWithheld || 0));
+// Helper function to categorize errors
+function categorizeError(error: any): string {
+  const message = error?.message?.toLowerCase() || ''
   
-  // Create entries for different types of 1099-MISC income
-  if (otherIncome > 0) {
-    await prisma.incomeEntry.create({
-      data: {
-        taxReturnId,
-        documentId,
-        incomeType: 'OTHER_INCOME',
-        description: `Other Income from ${extractedData.payerName || 'Payer'}`,
-        amount: otherIncome,
-        payerName: String(extractedData.payerName || ''),
-        payerTIN: String(extractedData.payerTIN || ''),
-        federalTaxWithheld: federalTaxWithheld
-      }
-    });
-    console.log(`✅ [INCOME] Created 1099-MISC other income entry: $${otherIncome.toLocaleString()}`);
+  if (message.includes('azure') || message.includes('document intelligence')) {
+    return 'EXTRACTION_ERROR'
+  }
+  if (message.includes('database') || message.includes('prisma')) {
+    return 'DATABASE_ERROR'
+  }
+  if (message.includes('state detection')) {
+    return 'STATE_DETECTION_ERROR'
+  }
+  if (message.includes('duplicate')) {
+    return 'DUPLICATE_DETECTION_ERROR'
+  }
+  if (message.includes('tax calculation')) {
+    return 'CALCULATION_ERROR'
+  }
+  if (message.includes('mapping')) {
+    return 'MAPPING_ERROR'
+  }
+  if (message.includes('authentication') || message.includes('unauthorized')) {
+    return 'AUTH_ERROR'
   }
   
-  if (rents > 0) {
-    await prisma.incomeEntry.create({
-      data: {
-        taxReturnId,
-        documentId,
-        incomeType: 'OTHER_INCOME',
-        description: `Rental Income from ${extractedData.payerName || 'Payer'}`,
-        amount: rents,
-        payerName: String(extractedData.payerName || ''),
-        payerTIN: String(extractedData.payerTIN || ''),
-        federalTaxWithheld: federalTaxWithheld
-      }
-    });
-    console.log(`✅ [INCOME] Created 1099-MISC rental income entry: $${rents.toLocaleString()}`);
-  }
-  
-  if (royalties > 0) {
-    await prisma.incomeEntry.create({
-      data: {
-        taxReturnId,
-        documentId,
-        incomeType: 'OTHER_INCOME',
-        description: `Royalties from ${extractedData.payerName || 'Payer'}`,
-        amount: royalties,
-        payerName: String(extractedData.payerName || ''),
-        payerTIN: String(extractedData.payerTIN || ''),
-        federalTaxWithheld: federalTaxWithheld
-      }
-    });
-    console.log(`✅ [INCOME] Created 1099-MISC royalties entry: $${royalties.toLocaleString()}`);
-  }
+  return 'UNKNOWN_ERROR'
 }
 
-// Create income entries for 1099-NEC documents
-async function create1099NecIncomeEntries(extractedData: ExtractedFieldData, documentId: string, taxReturnId: string): Promise<void> {
-  const nonemployeeCompensation = parseFloat(String(extractedData.nonemployeeCompensation || 0));
-  const federalTaxWithheld = parseFloat(String(extractedData.federalTaxWithheld || 0));
-  
-  if (nonemployeeCompensation > 0) {
-    await prisma.incomeEntry.create({
-      data: {
-        taxReturnId,
-        documentId,
-        incomeType: 'BUSINESS_INCOME',
-        description: `Nonemployee Compensation from ${extractedData.payerName || 'Payer'}`,
-        amount: nonemployeeCompensation,
-        payerName: String(extractedData.payerName || ''),
-        payerTIN: String(extractedData.payerTIN || ''),
-        federalTaxWithheld: federalTaxWithheld
-      }
-    });
-    console.log(`✅ [INCOME] Created 1099-NEC nonemployee compensation entry: $${nonemployeeCompensation.toLocaleString()}`);
+// Helper function to get user-friendly error messages
+function getUserFriendlyErrorMessage(errorType: string): string {
+  switch (errorType) {
+    case 'EXTRACTION_ERROR':
+      return 'Unable to extract data from document. Please ensure the document is clear and try again.'
+    case 'DATABASE_ERROR':
+      return 'Database error occurred. Please try again later.'
+    case 'STATE_DETECTION_ERROR':
+      return 'State detection failed. You may need to manually enter your state information.'
+    case 'DUPLICATE_DETECTION_ERROR':
+      return 'Error checking for duplicate documents. Processing continued successfully.'
+    case 'CALCULATION_ERROR':
+      return 'Tax calculation error occurred. Please review your information.'
+    case 'MAPPING_ERROR':
+      return 'Error mapping document data. Some fields may need manual entry.'
+    case 'AUTH_ERROR':
+      return 'Authentication error. Please log in again.'
+    default:
+      return 'Document processing failed. Please try again or contact support.'
   }
 }
-
-// Function to update income aggregation after creating income entries
-async function updateIncomeAggregation(taxReturnId: string): Promise<void> {
-  console.log(`🔍 [AGGREGATION] Updating income aggregation for tax return ${taxReturnId}...`);
-  
-  try {
-    // Get all income entries for this tax return
-    const incomeEntries = await prisma.incomeEntry.findMany({
-      where: { taxReturnId }
-    });
-    
-    // Calculate total income
-    const totalIncome = incomeEntries.reduce((sum, entry) => {
-      return sum + parseFloat(entry.amount.toString());
-    }, 0);
-    
-    // Calculate total withholdings
-    const totalWithholdings = incomeEntries.reduce((sum, entry) => {
-      return sum + parseFloat((entry.federalTaxWithheld || 0).toString());
-    }, 0);
-    
-    // Update the tax return with aggregated values
-    await prisma.taxReturn.update({
-      where: { id: taxReturnId },
-      data: {
-        totalIncome: totalIncome,
-        adjustedGrossIncome: totalIncome, // For now, AGI equals total income (before deductions)
-        totalWithholdings: totalWithholdings,
-        lastSavedAt: new Date()
-      }
-    });
-    
-    console.log(`✅ [AGGREGATION] Updated totals - Income: $${totalIncome.toLocaleString()}, Withholdings: $${totalWithholdings.toLocaleString()}`);
-  } catch (error) {
-    console.error("❌ [AGGREGATION] Failed to update income aggregation:", error);
-    throw error;
-  }
-}
-
