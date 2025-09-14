@@ -127,7 +127,7 @@ export async function POST(
     console.log("🔍 [PROCESS] Step 5: Azure Document Intelligence configuration...")
     const azureConfig = {
       endpoint: process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT!,
-      apiKey: process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY!
+      apiKey: process.env.AZURE_DOCUMENT_INTELLIGENCE_API_KEY!
     }
 
     if (!azureConfig.endpoint || !azureConfig.apiKey) {
