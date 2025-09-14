@@ -91,6 +91,16 @@ model TaxReturn {
     refundAmount      Decimal        @default(0) @db.Decimal(12, 2)
     amountOwed        Decimal        @default(0) @db.Decimal(12, 2)
     
+    // State tax fields - NEW
+    detectedState     String?        
+    stateConfidence   Float?         @default(0)
+    stateSource       StateDetectionSource? 
+    stateTaxLiability Decimal        @default(0) @db.Decimal(12, 2)
+    stateStandardDeduction Decimal   @default(0) @db.Decimal(12, 2)
+    stateTaxableIncome Decimal       @default(0) @db.Decimal(12, 2)
+    stateEffectiveRate Float         @default(0)
+    stateItemizedDeduction Decimal   @default(0) @db.Decimal(12, 2)
+    
     // Status tracking
     currentStep       Int            @default(1)
     completedSteps    Int[]          @default([])
@@ -286,5 +296,13 @@ enum EntryType {
     DEDUCTION
     CREDIT
     WITHHOLDING
+}
+
+enum StateDetectionSource {
+    ADDRESS
+    EMPLOYER
+    DOCUMENT_TYPE
+    MANUAL
+    UNKNOWN
 }
 
