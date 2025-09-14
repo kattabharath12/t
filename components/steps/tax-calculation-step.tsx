@@ -6,8 +6,10 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Alert, AlertDescription } from "@/components/ui/alert"
-import { Calculator, ArrowRight, ArrowLeft, TrendingUp, TrendingDown, Minus } from "lucide-react"
+import { Calculator, ArrowRight, ArrowLeft, TrendingUp, TrendingDown, Minus, MapPin } from "lucide-react"
 import { calculateTaxReturn } from "@/lib/tax-calculations"
+import { calculateEnhancedTaxReturnWithState } from "@/lib/enhanced-tax-calculations"
+import { getStateInfo } from "@/lib/state-tax-data"
 
 interface TaxCalculationStepProps {
   taxReturn: any
@@ -33,15 +35,32 @@ export function TaxCalculationStep({ taxReturn, onUpdate, onNext, onPrev, loadin
       sum + parseFloat(entry.federalTaxWithheld || 0), 0
     ) || 0
     
-    const result = calculateTaxReturn({
-      totalIncome,
-      filingStatus: taxReturn.filingStatus,
-      dependents: taxReturn.dependents || [],
-      itemizedDeductions,
-      totalWithholdings,
-    })
+    // Use enhanced calculation with state tax if state is detected
+    const stateCode = taxReturn.detectedState || taxReturn.state
     
-    setCalculation(result)
+    if (stateCode) {
+      console.log('🏛️ [TAX CALC] Calculating with state taxes for:', stateCode)
+      const result = calculateEnhancedTaxReturnWithState({
+        totalIncome,
+        filingStatus: taxReturn.filingStatus,
+        dependents: taxReturn.dependents || [],
+        itemizedDeductions,
+        totalWithholdings,
+        stateCode,
+        stateItemizedDeductions: itemizedDeductions, // Use same deductions for state
+      })
+      setCalculation(result)
+    } else {
+      console.log('🏛️ [TAX CALC] Calculating federal taxes only')
+      const result = calculateTaxReturn({
+        totalIncome,
+        filingStatus: taxReturn.filingStatus,
+        dependents: taxReturn.dependents || [],
+        itemizedDeductions,
+        totalWithholdings,
+      })
+      setCalculation(result)
+    }
   }, [taxReturn])
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -49,7 +68,8 @@ export function TaxCalculationStep({ taxReturn, onUpdate, onNext, onPrev, loadin
     
     if (!calculation) return
     
-    await onUpdate({
+    // Prepare update data with both federal and state tax information
+    const updateData: any = {
       totalIncome: calculation.grossIncome,
       adjustedGrossIncome: calculation.adjustedGrossIncome,
       standardDeduction: calculation.standardDeduction,
@@ -60,7 +80,18 @@ export function TaxCalculationStep({ taxReturn, onUpdate, onNext, onPrev, loadin
       totalWithholdings: calculation.totalWithholdings,
       refundAmount: calculation.refundAmount,
       amountOwed: calculation.amountOwed,
-    })
+    }
+    
+    // Add state tax data if available
+    if (calculation.stateTax) {
+      updateData.stateTaxLiability = calculation.stateTax.stateTaxLiability
+      updateData.stateStandardDeduction = calculation.stateTax.stateStandardDeduction
+      updateData.stateTaxableIncome = calculation.stateTax.stateTaxableIncome
+      updateData.stateEffectiveRate = calculation.stateTax.stateEffectiveRate
+      updateData.stateItemizedDeduction = calculation.stateTax.stateItemizedDeduction
+    }
+    
+    await onUpdate(updateData)
     onNext()
   }
 
@@ -77,6 +108,8 @@ export function TaxCalculationStep({ taxReturn, onUpdate, onNext, onPrev, loadin
 
   const isRefund = calculation.refundAmount > 0
   const amount = isRefund ? calculation.refundAmount : calculation.amountOwed
+  const stateCode = taxReturn.detectedState || taxReturn.state
+  const stateInfo = stateCode ? getStateInfo(stateCode) : null
 
   return (
     <form onSubmit={handleSubmit} className="space-y-6">
@@ -84,9 +117,37 @@ export function TaxCalculationStep({ taxReturn, onUpdate, onNext, onPrev, loadin
         <Alert>
           <Calculator className="h-4 w-4" />
           <AlertDescription>
-            Based on your income, deductions, and credits, here's your calculated tax liability.
+            Based on your income, deductions, and credits, here's your calculated tax liability
+            {stateInfo && (
+              <>
+                {" "} (including {stateInfo.hasIncomeTax ? `${stateInfo.stateName} state taxes` : `no state taxes for ${stateInfo.stateName}`})
+              </>
+            )}.
           </AlertDescription>
         </Alert>
+
+        {/* State Detection Status */}
+        {stateCode && (
+          <Alert>
+            <MapPin className="h-4 w-4" />
+            <AlertDescription>
+              {taxReturn.detectedState ? (
+                <>
+                  Automatically detected state: <strong>{stateInfo?.stateName}</strong>
+                  {taxReturn.stateConfidence && (
+                    <span className="text-sm text-gray-500 ml-2">
+                      (confidence: {Math.round(taxReturn.stateConfidence * 100)}%)
+                    </span>
+                  )}
+                </>
+              ) : (
+                <>
+                  Using state: <strong>{stateInfo?.stateName}</strong>
+                </>
+              )}
+            </AlertDescription>
+          </Alert>
+        )}
 
         {/* Tax Calculation Result */}
         <Card>
@@ -163,9 +224,31 @@ export function TaxCalculationStep({ taxReturn, onUpdate, onNext, onPrev, loadin
               </div>
               
               <div className="flex justify-between items-center py-2 border-b">
-                <span className="text-gray-600">Tax Liability</span>
+                <span className="text-gray-600">Federal Tax Liability</span>
                 <span className="font-medium">${calculation.taxLiability.toLocaleString()}</span>
               </div>
+              
+              {/* State Tax Information */}
+              {calculation.stateTax && (
+                <>
+                  {calculation.stateTax.hasIncomeTax ? (
+                    <div className="flex justify-between items-center py-2 border-b">
+                      <span className="text-gray-600">{calculation.stateTax.stateName} State Tax</span>
+                      <span className="font-medium">${calculation.stateTax.stateTaxLiability.toLocaleString()}</span>
+                    </div>
+                  ) : (
+                    <div className="flex justify-between items-center py-2 border-b">
+                      <span className="text-gray-600">{calculation.stateTax.stateName} State Tax</span>
+                      <span className="font-medium text-green-600">$0 (No state income tax)</span>
+                    </div>
+                  )}
+                  
+                  <div className="flex justify-between items-center py-2 border-b font-medium">
+                    <span>Combined Tax Liability</span>
+                    <span>${(calculation.taxLiability + calculation.stateTax.stateTaxLiability).toLocaleString()}</span>
+                  </div>
+                </>
+              )}
               
               {calculation.childTaxCredit > 0 && (
                 <div className="flex justify-between items-center py-2 border-b">
@@ -217,25 +300,50 @@ export function TaxCalculationStep({ taxReturn, onUpdate, onNext, onPrev, loadin
             <CardTitle>Tax Rate Information</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="grid grid-cols-2 gap-4">
+            <div className={`grid gap-4 ${calculation.stateTax ? 'grid-cols-2 md:grid-cols-4' : 'grid-cols-2'}`}>
               <div className="text-center p-4 bg-blue-50 rounded-lg">
                 <div className="text-2xl font-bold text-blue-600">
                   {calculation.effectiveRate.toFixed(2)}%
                 </div>
-                <p className="text-sm text-blue-800">Effective Tax Rate</p>
+                <p className="text-sm text-blue-800">Federal Effective Rate</p>
                 <p className="text-xs text-gray-600 mt-1">
-                  Actual percentage of income paid in taxes
+                  Federal tax as % of income
                 </p>
               </div>
               <div className="text-center p-4 bg-purple-50 rounded-lg">
                 <div className="text-2xl font-bold text-purple-600">
                   {calculation.marginalRate.toFixed(0)}%
                 </div>
-                <p className="text-sm text-purple-800">Marginal Tax Rate</p>
+                <p className="text-sm text-purple-800">Federal Marginal Rate</p>
                 <p className="text-xs text-gray-600 mt-1">
-                  Tax rate on your last dollar of income
+                  Federal rate on last dollar
                 </p>
               </div>
+              
+              {/* State Tax Rates */}
+              {calculation.stateTax && (
+                <>
+                  <div className="text-center p-4 bg-green-50 rounded-lg">
+                    <div className="text-2xl font-bold text-green-600">
+                      {calculation.stateTax.stateEffectiveRate.toFixed(2)}%
+                    </div>
+                    <p className="text-sm text-green-800">State Effective Rate</p>
+                    <p className="text-xs text-gray-600 mt-1">
+                      {calculation.stateTax.stateName} tax as % of income
+                    </p>
+                  </div>
+                  <div className="text-center p-4 bg-orange-50 rounded-lg">
+                    <div className="text-2xl font-bold text-orange-600">
+                      {calculation.combinedTaxResult?.totalEffectiveRate?.toFixed(2) || 
+                       (calculation.effectiveRate + calculation.stateTax.stateEffectiveRate).toFixed(2)}%
+                    </div>
+                    <p className="text-sm text-orange-800">Combined Effective Rate</p>
+                    <p className="text-xs text-gray-600 mt-1">
+                      Total tax as % of income
+                    </p>
+                  </div>
+                </>
+              )}
             </div>
           </CardContent>
         </Card>
