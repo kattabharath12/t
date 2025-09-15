@@ -63,31 +63,48 @@ export function DashboardClient({ user }: DashboardClientProps) {
       // Fetch documents from the current tax return or all user documents
       const currentTaxReturn = user.taxReturns.find(tr => tr.taxYear === 2024)
       if (currentTaxReturn) {
-        console.log('🔍 [Dashboard] Fetching documents for tax return:', currentTaxReturn.id)
+        console.log('🔍 [Dashboard] Fetching documents for tax return:', currentTaxReturn.id, `(attempt ${retryCount + 1})`)
         const response = await fetch(`/api/tax-returns/${currentTaxReturn.id}/documents`)
         if (response.ok) {
           const data = await response.json()
           console.log('📄 [Dashboard] Documents fetched:', data.length, 'documents')
           
-          // Only update if we have data or if this is the first fetch
-          if (data.length > 0 || documents.length === 0) {
+          // Log processing status for debugging
+          const processingDocs = data.filter((doc: any) => doc.processingStatus === 'PROCESSING')
+          const completedDocs = data.filter((doc: any) => doc.processingStatus === 'COMPLETED')
+          console.log('📊 [Dashboard] Document status:', { 
+            processing: processingDocs.length, 
+            completed: completedDocs.length,
+            total: data.length 
+          })
+          
+          // Enhanced state preservation: Only update if we have valid data OR this is the first successful fetch
+          if (data.length > 0 || documents.length === 0 || retryCount === 0) {
             setDocuments(data)
           } else {
-            console.warn('⚠️ [Dashboard] API returned empty documents, keeping existing state')
+            console.warn('⚠️ [Dashboard] API returned empty documents, preserving existing state to prevent UI flashing')
           }
         } else {
           console.error('❌ [Dashboard] Failed to fetch documents:', response.status, response.statusText)
-          // Retry once on failure
-          if (retryCount < 1) {
-            setTimeout(() => fetchDocuments(retryCount + 1), 2000)
+          // More aggressive retry strategy for dashboard
+          if (retryCount < 4) { // Increased from 2 to 4
+            const delay = Math.min((retryCount + 1) * 2000, 10000) // Cap at 10 seconds
+            console.log(`🔄 [Dashboard] Retrying document fetch in ${delay/1000}s... (retry ${retryCount + 1}/4)`)
+            setTimeout(() => fetchDocuments(retryCount + 1), delay)
+          } else {
+            console.error('❌ [Dashboard] Max retries reached for fetching documents')
           }
         }
       }
     } catch (error) {
       console.error("❌ [Dashboard] Error fetching documents:", error)
-      // Retry once on error
-      if (retryCount < 1) {
-        setTimeout(() => fetchDocuments(retryCount + 1), 2000)
+      // More aggressive retry strategy for dashboard
+      if (retryCount < 4) { // Increased from 2 to 4
+        const delay = Math.min((retryCount + 1) * 2000, 10000) // Cap at 10 seconds
+        console.log(`🔄 [Dashboard] Retrying document fetch due to error in ${delay/1000}s... (retry ${retryCount + 1}/4)`)
+        setTimeout(() => fetchDocuments(retryCount + 1), delay)
+      } else {
+        console.error('❌ [Dashboard] Max retries reached for fetching documents due to error')
       }
     } finally {
       if (retryCount === 0) {
