@@ -54,26 +54,50 @@ export function DashboardClient({ user }: DashboardClientProps) {
     fetchDocuments()
   }, [])
 
-  const fetchDocuments = async () => {
-    setDocumentsLoading(true)
+  const fetchDocuments = async (retryCount = 0) => {
+    if (retryCount === 0) {
+      setDocumentsLoading(true)
+    }
+    
     try {
       // Fetch documents from the current tax return or all user documents
       const currentTaxReturn = user.taxReturns.find(tr => tr.taxYear === 2024)
       if (currentTaxReturn) {
+        console.log('🔍 [Dashboard] Fetching documents for tax return:', currentTaxReturn.id)
         const response = await fetch(`/api/tax-returns/${currentTaxReturn.id}/documents`)
         if (response.ok) {
           const data = await response.json()
-          setDocuments(data)
+          console.log('📄 [Dashboard] Documents fetched:', data.length, 'documents')
+          
+          // Only update if we have data or if this is the first fetch
+          if (data.length > 0 || documents.length === 0) {
+            setDocuments(data)
+          } else {
+            console.warn('⚠️ [Dashboard] API returned empty documents, keeping existing state')
+          }
+        } else {
+          console.error('❌ [Dashboard] Failed to fetch documents:', response.status, response.statusText)
+          // Retry once on failure
+          if (retryCount < 1) {
+            setTimeout(() => fetchDocuments(retryCount + 1), 2000)
+          }
         }
       }
     } catch (error) {
-      console.error("Error fetching documents:", error)
+      console.error("❌ [Dashboard] Error fetching documents:", error)
+      // Retry once on error
+      if (retryCount < 1) {
+        setTimeout(() => fetchDocuments(retryCount + 1), 2000)
+      }
     } finally {
-      setDocumentsLoading(false)
+      if (retryCount === 0) {
+        setDocumentsLoading(false)
+      }
     }
   }
 
   const handleDocumentProcessed = () => {
+    console.log('🔄 [Dashboard] Document processed, refreshing documents...')
     fetchDocuments() // Refresh documents after processing
   }
 
