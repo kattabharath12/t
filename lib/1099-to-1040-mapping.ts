@@ -28,7 +28,18 @@ export class Form1099ToForm1040Mapper {
     // Personal Information Mapping - Enhanced to prioritize 1099 data
     console.log('🔍 [1099 MAPPER] Starting personal information mapping...');
     
-    const recipientName = actual1099Data.recipientName || actual1099Data.Recipient?.Name || actual1099Data['Recipient.Name'];
+    let recipientName = actual1099Data.recipientName || actual1099Data.Recipient?.Name || actual1099Data['Recipient.Name'];
+    
+    // ENHANCED: OCR fallback for name extraction if structured data doesn't have name
+    if (!recipientName && actual1099Data.fullText) {
+      console.log('🔍 [1099 MAPPER] No structured recipient name found, attempting OCR extraction...');
+      const personalInfoFromOCR = this.extractPersonalInfoFromOCR(actual1099Data.fullText);
+      recipientName = personalInfoFromOCR.name;
+      if (recipientName) {
+        console.log('✅ [1099 MAPPER] Extracted recipient name from OCR:', recipientName);
+      }
+    }
+    
     if (recipientName) {
       console.log('🔍 [1099 MAPPER] Mapping recipient name from 1099:', recipientName);
       const nameParts = recipientName.trim().split(/\s+/);
@@ -38,6 +49,8 @@ export class Form1099ToForm1040Mapper {
         form1040Data.lastName = nameParts.slice(1).join(' ') || '';
         console.log('✅ [1099 MAPPER] Mapped name - First:', form1040Data.firstName, 'Last:', form1040Data.lastName);
       }
+    } else {
+      console.log('⚠️ [1099 MAPPER] No recipient name found in 1099 data');
     }
 
     const recipientTIN = actual1099Data.recipientTIN || actual1099Data.Recipient?.TIN || actual1099Data['Recipient.TIN'];
@@ -68,7 +81,7 @@ export class Form1099ToForm1040Mapper {
       });
     }
 
-    // Create or update personal info object
+    // ENHANCED: Create or update personal info object
     if (!form1040Data.personalInfo || !form1040Data.personalInfo.sourceDocument?.includes('W2')) {
       const personalInfo = {
         firstName: form1040Data.firstName ?? '',
@@ -83,8 +96,13 @@ export class Form1099ToForm1040Mapper {
         sourceDocumentId: String(actual1099Data.documentId || 'unknown')
       };
 
-      form1040Data.personalInfo = personalInfo;
-      console.log('✅ [1099 MAPPER] Created/updated personalInfo object:', personalInfo);
+      // CRITICAL FIX: Only create personalInfo if we actually extracted meaningful data
+      if (personalInfo.firstName || personalInfo.lastName || personalInfo.ssn || personalInfo.address) {
+        form1040Data.personalInfo = personalInfo;
+        console.log('✅ [1099 MAPPER] Created/updated personalInfo object:', personalInfo);
+      } else {
+        console.log('⚠️ [1099 MAPPER] No meaningful personal info extracted from 1099, skipping personalInfo creation');
+      }
     }
 
     // Income Mapping based on 1099 type
@@ -659,6 +677,160 @@ export class Form1099ToForm1040Mapper {
     };
     console.log('⚠️ [1099 ADDRESS PARSER] Could not parse address, using as street only:', result);
     return result;
+  }
+
+  /**
+   * Extracts personal information from 1099 OCR text using comprehensive regex patterns
+   * Specifically designed for 1099 form OCR text patterns with enhanced fallback mechanisms
+   */
+  private static extractPersonalInfoFromOCR(ocrText: string): {
+    name?: string;
+    tin?: string;
+    address?: string;
+    payerName?: string;
+    payerTIN?: string;
+  } {
+    console.log('🔍 [1099 MAPPER OCR] Searching for 1099 personal info in OCR text...');
+    
+    const info: { 
+      name?: string; 
+      tin?: string; 
+      address?: string;
+      payerName?: string;
+      payerTIN?: string;
+    } = {};
+    
+    // === RECIPIENT NAME PATTERNS for 1099 forms ===
+    const recipientNamePatterns = [
+      // Pattern: "RECIPIENT'S name John Doe"
+      /(?:RECIPIENT'S?\s+name|Recipient'?s?\s+name)[:\s]+([A-Z][a-z]+\s+[A-Z][a-z]+)/i,
+      // Pattern: "RECIPIENT'S name\nJohn Doe"
+      /(?:RECIPIENT'S?\s+name|Recipient'?s?\s+name)\s*\n([A-Z][a-z]+\s+[A-Z][a-z]+)/i,
+      // Pattern: Multi-line "RECIPIENT'S name\nJOHN\nDOE"
+      /(?:RECIPIENT'S?\s+name|Recipient'?s?\s+name)\s*\n\s*([A-Z]+)\s*\n\s*([A-Z]+)/i,
+      // Pattern: "Recipient John Doe"
+      /(?:^|[^a-zA-Z])Recipient\s+([A-Z][a-z]+\s+[A-Z][a-z]+)/i,
+      // Pattern: Look for names after "Recipient" section
+      /Recipient[^a-zA-Z]*([A-Z][a-z]+\s+[A-Z][a-z]+)/i
+    ];
+    
+    // Try recipient name patterns
+    for (let i = 0; i < recipientNamePatterns.length; i++) {
+      const pattern = recipientNamePatterns[i];
+      const match = ocrText.match(pattern);
+      if (match) {
+        let name;
+        
+        if (i === 2) { // Multi-line format
+          name = `${match[1].trim()} ${match[2].trim()}`;
+        } else if (match[1]) {
+          name = match[1].trim();
+        }
+        
+        // Validate the name
+        if (name && this.isValidPersonName(name)) {
+          console.log('✅ [1099 MAPPER OCR] Found recipient name:', name);
+          info.name = this.formatName(name);
+          break;
+        }
+      }
+    }
+    
+    // === RECIPIENT TIN/SSN PATTERNS ===
+    const tinPatterns = [
+      // Pattern: "RECIPIENT'S TIN 123-45-6789"
+      /(?:RECIPIENT'S?\s+TIN|Recipient'?s?\s+TIN)[:\s]*([0-9]{3}-[0-9]{2}-[0-9]{4})/i,
+      // Pattern: "TIN 123456789"
+      /TIN[:\s]*([0-9]{9})/i,
+      // Pattern: "SSN: 123-45-6789"
+      /SSN[:\s]*([0-9]{3}-[0-9]{2}-[0-9]{4})/i
+    ];
+    
+    for (const pattern of tinPatterns) {
+      const match = ocrText.match(pattern);
+      if (match && match[1]) {
+        info.tin = match[1];
+        console.log('✅ [1099 MAPPER OCR] Found recipient TIN:', info.tin);
+        break;
+      }
+    }
+    
+    // === PAYER NAME PATTERNS ===
+    const payerNamePatterns = [
+      // Pattern: "PAYER'S name Company Name"
+      /(?:PAYER'S?\s+name|Payer'?s?\s+name)[:\s]+([A-Za-z\s&,.]+?)(?:\n|PAYER|$)/i,
+      // Pattern: "Payer: Company Name"
+      /Payer[:\s]+([A-Za-z\s&,.]+?)(?:\n|TIN|$)/i
+    ];
+    
+    for (const pattern of payerNamePatterns) {
+      const match = ocrText.match(pattern);
+      if (match && match[1] && match[1].trim().length > 2) {
+        info.payerName = match[1].trim();
+        console.log('✅ [1099 MAPPER OCR] Found payer name:', info.payerName);
+        break;
+      }
+    }
+    
+    // === PAYER TIN PATTERNS ===
+    const payerTinPatterns = [
+      // Pattern: "PAYER'S TIN 12-3456789"
+      /(?:PAYER'S?\s+TIN|Payer'?s?\s+TIN)[:\s]*([0-9]{2}-[0-9]{7})/i,
+      // Pattern: "EIN: 12-3456789"
+      /EIN[:\s]*([0-9]{2}-[0-9]{7})/i
+    ];
+    
+    for (const pattern of payerTinPatterns) {
+      const match = ocrText.match(pattern);
+      if (match && match[1]) {
+        info.payerTIN = match[1];
+        console.log('✅ [1099 MAPPER OCR] Found payer TIN:', info.payerTIN);
+        break;
+      }
+    }
+    
+    if (!info.name && !info.tin) {
+      console.log('⚠️ [1099 MAPPER OCR] No personal info found in OCR text');
+    }
+    
+    return info;
+  }
+  
+  /**
+   * Validates if a string is a real person name
+   */
+  private static isValidPersonName(name: string): boolean {
+    if (!name || name.length < 3 || name.length > 50) return false;
+    
+    const words = name.trim().split(/\s+/);
+    if (words.length < 2 || words.length > 4) return false; // Allow 2-4 words for names
+    
+    // Each word should be 2-20 characters, mostly letters
+    for (const word of words) {
+      if (word.length < 2 || word.length > 20) return false;
+      if (!/^[A-Za-z]+$/.test(word)) return false;
+    }
+    
+    // Exclude business/form terms
+    const forbidden = [
+      'RECIPIENT', 'PAYER', 'INCOME', 'INTEREST', 'DIVIDEND', 'DISTRIBUTION',
+      'FEDERAL', 'STATE', 'TAX', 'FORM', 'BOX', 'TOTAL', 'AMOUNT',
+      'WITHHOLDING', 'BACKUP', 'SUBSTITUTE', 'COPY', 'DEPARTMENT',
+      'TREASURY', 'SERVICE', 'INTERNAL', 'REVENUE'
+    ];
+    
+    const upperName = name.toUpperCase();
+    return !forbidden.some(term => upperName.includes(term));
+  }
+  
+  /**
+   * Format name from "JOHN DOE" to "John Doe"
+   */
+  private static formatName(name: string): string {
+    return name.toLowerCase()
+      .split(' ')
+      .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(' ');
   }
 
   private static recalculateForm1040Totals(form1040Data: Partial<Form1040Data>): void {
