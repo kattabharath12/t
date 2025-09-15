@@ -310,12 +310,43 @@ export async function POST(
     let taxCalculationResult = null
     
     try {
-      // Recalculate all income entries for this tax return
-      const allIncomeEntries = await prisma.incomeEntry.findMany({
-        where: { taxReturnId: document.taxReturnId }
+      // CRITICAL FIX: Only include income entries from existing documents (not orphaned ones)
+      const validIncomeEntries = await prisma.incomeEntry.findMany({
+        where: { 
+          taxReturnId: document.taxReturnId,
+          // Only include entries that have a valid document reference
+          documentId: { not: null },
+          // Verify the document actually exists
+          document: { isNot: null }
+        },
+        include: {
+          document: {
+            select: { id: true, processingStatus: true }
+          }
+        }
       })
       
-      const totalIncome = allIncomeEntries.reduce((sum, entry) => 
+      console.log(`📊 [PROCESS] Found ${validIncomeEntries.length} valid income entries from existing documents`)
+      
+      // Cleanup orphaned entries (entries where documentId is null)
+      const orphanedEntries = await prisma.incomeEntry.findMany({
+        where: { 
+          taxReturnId: document.taxReturnId,
+          documentId: null
+        }
+      })
+      
+      if (orphanedEntries.length > 0) {
+        console.log(`🧹 [PROCESS] Cleaning up ${orphanedEntries.length} orphaned income entries`)
+        await prisma.incomeEntry.deleteMany({
+          where: { 
+            taxReturnId: document.taxReturnId,
+            documentId: null
+          }
+        })
+      }
+      
+      const totalIncome = validIncomeEntries.reduce((sum, entry) => 
         sum + parseFloat(entry.amount.toString()), 0)
       
       // Get dependents for credit calculations
