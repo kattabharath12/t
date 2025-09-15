@@ -347,20 +347,39 @@ export async function GET(
     console.log(`✅ [1040 GET] Recalculated totals - Line 9 (Total Income): $${form1040Data.line9}, Line 11 (AGI): $${form1040Data.line11}, Line 25a (Total Withholdings): $${form1040Data.line25a || 0}`);
     
 
-    // Fill in basic info from tax return if not already populated
-    // IMPORTANT: Only fill from taxReturn if we don't have W2 personal info
-    const hasW2PersonalInfo = form1040Data.personalInfo && (
+    // ENHANCED: Fill in basic info from tax return and ensure proper sync between personalInfo and top-level fields
+    const hasPersonalInfoData = form1040Data.personalInfo && (
       form1040Data.personalInfo.firstName || 
       form1040Data.personalInfo.lastName || 
       form1040Data.personalInfo.ssn || 
       form1040Data.personalInfo.address
     );
     
-    console.log(`🔍 [1040 GET DEBUG] hasW2PersonalInfo: ${hasW2PersonalInfo}`);
-    console.log(`🔍 [1040 GET DEBUG] form1040Data.firstName: ${form1040Data.firstName}`);
+    console.log(`🔍 [1040 GET DEBUG] hasPersonalInfoData: ${hasPersonalInfoData}`);
+    console.log(`🔍 [1040 GET DEBUG] current form1040Data.firstName: "${form1040Data.firstName || 'NOT SET'}"`);
+    console.log(`🔍 [1040 GET DEBUG] personalInfo.firstName: "${form1040Data.personalInfo?.firstName || 'NOT SET'}"`);
     
-    if (!form1040Data.firstName && !hasW2PersonalInfo) {
-      console.log("🔍 [1040 GET] No W2 personal info found, filling from taxReturn data");
+    // CRITICAL FIX: Always sync personalInfo to top-level fields if personalInfo exists
+    if (hasPersonalInfoData) {
+      console.log("🔧 [1040 GET] CRITICAL FIX: Syncing personalInfo to top-level fields...");
+      
+      // ALWAYS use personalInfo data for top-level fields (it's extracted from documents)
+      form1040Data.firstName = form1040Data.personalInfo?.firstName || form1040Data.firstName || '';
+      form1040Data.lastName = form1040Data.personalInfo?.lastName || form1040Data.lastName || '';
+      form1040Data.ssn = form1040Data.personalInfo?.ssn || form1040Data.ssn || '';
+      form1040Data.address = form1040Data.personalInfo?.address || form1040Data.address || '';
+      form1040Data.city = form1040Data.personalInfo?.city || form1040Data.city || '';
+      form1040Data.state = form1040Data.personalInfo?.state || form1040Data.state || '';
+      form1040Data.zipCode = form1040Data.personalInfo?.zipCode || form1040Data.zipCode || '';
+      
+      console.log(`✅ [1040 GET] Synced personalInfo to top-level: "${form1040Data.firstName} ${form1040Data.lastName}"`);
+      
+      // Set other required fields from taxReturn
+      form1040Data.filingStatus = form1040Data.filingStatus || taxReturn.filingStatus as any;
+      form1040Data.taxYear = form1040Data.taxYear || taxReturn.taxYear;
+      
+    } else if (!form1040Data.firstName && !form1040Data.lastName) {
+      console.log("🔍 [1040 GET] No personal info from documents, filling from taxReturn data");
       form1040Data.firstName = taxReturn.firstName || '';
       form1040Data.lastName = taxReturn.lastName || '';
       form1040Data.ssn = taxReturn.ssn || '';
@@ -373,37 +392,10 @@ export async function GET(
       form1040Data.zipCode = taxReturn.zipCode || '';
       form1040Data.filingStatus = taxReturn.filingStatus as any;
       form1040Data.taxYear = taxReturn.taxYear;
-    } else if (hasW2PersonalInfo) {
-      console.log("✅ [1040 GET] W2 personal info exists, preserving it and ensuring top-level fields are set");
-      // Ensure top-level fields are set from W2 data if they exist
-      if (!form1040Data.firstName && form1040Data.personalInfo?.firstName) {
-        form1040Data.firstName = form1040Data.personalInfo.firstName;
-      }
-      if (!form1040Data.lastName && form1040Data.personalInfo?.lastName) {
-        form1040Data.lastName = form1040Data.personalInfo.lastName;
-      }
-      if (!form1040Data.ssn && form1040Data.personalInfo?.ssn) {
-        form1040Data.ssn = form1040Data.personalInfo.ssn;
-      }
-      if (!form1040Data.address && form1040Data.personalInfo?.address) {
-        form1040Data.address = form1040Data.personalInfo.address;
-      }
-      if (!form1040Data.city && form1040Data.personalInfo?.city) {
-        form1040Data.city = form1040Data.personalInfo.city;
-      }
-      if (!form1040Data.state && form1040Data.personalInfo?.state) {
-        form1040Data.state = form1040Data.personalInfo.state;
-      }
-      if (!form1040Data.zipCode && form1040Data.personalInfo?.zipCode) {
-        form1040Data.zipCode = form1040Data.personalInfo.zipCode;
-      }
-      
-      // Set other required fields from taxReturn
-      form1040Data.filingStatus = form1040Data.filingStatus || taxReturn.filingStatus as any;
-      form1040Data.taxYear = form1040Data.taxYear || taxReturn.taxYear;
     } else {
-      console.log("🔍 [1040 GET] Top-level firstName exists, filling missing fields from taxReturn");
+      console.log("🔍 [1040 GET] Some personal info already exists, filling missing fields from taxReturn");
       // Fill in missing fields from taxReturn without overriding existing data
+      form1040Data.firstName = form1040Data.firstName || taxReturn.firstName || '';
       form1040Data.lastName = form1040Data.lastName || taxReturn.lastName || '';
       form1040Data.ssn = form1040Data.ssn || taxReturn.ssn || '';
       form1040Data.spouseFirstName = form1040Data.spouseFirstName || taxReturn.spouseFirstName || undefined;
@@ -415,6 +407,17 @@ export async function GET(
       form1040Data.zipCode = form1040Data.zipCode || taxReturn.zipCode || '';
       form1040Data.filingStatus = form1040Data.filingStatus || taxReturn.filingStatus as any;
       form1040Data.taxYear = form1040Data.taxYear || taxReturn.taxYear;
+    }
+    
+    // FINAL VALIDATION: Ensure we have the minimum required fields
+    console.log(`🔍 [1040 GET FINAL] Final validation of personal info:`);
+    console.log(`  - firstName: "${form1040Data.firstName || 'MISSING'}"`);
+    console.log(`  - lastName: "${form1040Data.lastName || 'MISSING'}"`);
+    console.log(`  - ssn: "${form1040Data.ssn || 'MISSING'}"`);
+    console.log(`  - address: "${form1040Data.address || 'MISSING'}"`);
+    
+    if (!form1040Data.firstName && !form1040Data.lastName) {
+      console.log("⚠️ [1040 GET FINAL WARNING] No names found in any source - user will need to enter manually");
     }
 
     // ===== CRITICAL TAX CALCULATION FIX - ADD THIS BLOCK =====
