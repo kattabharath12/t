@@ -2,7 +2,7 @@
 import { getServerSession } from "next-auth"
 import { redirect } from "next/navigation"
 import { prisma } from "@/lib/db"
-import { DashboardClient } from "@/components/dashboard-client"
+import { EnhancedDashboardClient } from "@/components/enhanced-dashboard-client"
 
 export default async function DashboardPage() {
   const session = await getServerSession()
@@ -25,5 +25,5 @@ export default async function DashboardPage() {
     redirect("/auth/login")
   }
 
-  return <DashboardClient user={user} />
+  return <EnhancedDashboardClient user={user} />
 }
