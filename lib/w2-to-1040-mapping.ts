@@ -144,7 +144,7 @@ export class W2ToForm1040Mapper {
       }
     }
 
-    // Create personal info object for easy access - ALWAYS use current document data
+    // ENHANCED: Create personal info object for easy access - ALWAYS use current document data
     const personalInfo = {
       firstName: form1040Data.firstName ?? '',
       lastName: form1040Data.lastName ?? '',
@@ -157,9 +157,13 @@ export class W2ToForm1040Mapper {
       sourceDocumentId: String(actualW2Data.documentId || 'unknown')
     };
 
-    // Add personal info to the form data for easy access by frontend
-    form1040Data.personalInfo = personalInfo;
-    console.log('✅ [W2 MAPPER] Created personalInfo object:', personalInfo);
+    // CRITICAL FIX: Only create personalInfo if we actually extracted meaningful data
+    if (personalInfo.firstName || personalInfo.lastName || personalInfo.ssn || personalInfo.address) {
+      form1040Data.personalInfo = personalInfo;
+      console.log('✅ [W2 MAPPER] Created personalInfo object:', personalInfo);
+    } else {
+      console.log('⚠️ [W2 MAPPER] No meaningful personal info extracted from W2, skipping personalInfo creation');
+    }
 
     // Income Mapping - try multiple possible field names
     // Line 1: Total amount from Form(s) W-2, box 1
