@@ -382,31 +382,70 @@ export function DocumentProcessor({
 
       // If we reach here without completing, there might be an issue
       // Let's poll the document status to get the final result
-      console.log('🔍 [FALLBACK] Polling document status for final result...')
+      console.log('🔍 [FALLBACK] Streaming completed without result, polling document status...')
       await pollDocumentStatus(document.id, index, updateDocumentState)
 
     } catch (error) {
       console.error('Document processing error:', error)
-      updateDocumentState({
-        status: 'error',
-        progress: 0,
-        message: error instanceof Error ? error.message : 'An error occurred during processing'
-      })
+      
+      // Check if this is a network error vs. actual processing error
+      const errorMessage = error instanceof Error ? error.message : 'An error occurred during processing'
+      const isNetworkError = errorMessage.includes('fetch') || 
+                            errorMessage.includes('network') || 
+                            errorMessage.includes('connection') ||
+                            errorMessage.includes('Failed to upload document')
+      
+      if (isNetworkError) {
+        console.log('🔍 [NETWORK ERROR] Network issue detected, attempting to check document status...')
+        // For network errors, try to check if the document was actually uploaded successfully
+        const currentDoc = state.processedDocuments[index]?.document
+        if (currentDoc && currentDoc.id) {
+          updateDocumentState({
+            status: 'processing',
+            progress: 70,
+            message: 'Checking document status due to network issue...'
+          })
+          await pollDocumentStatus(currentDoc.id, index, updateDocumentState)
+        } else {
+          updateDocumentState({
+            status: 'error',
+            progress: 0,
+            message: 'Upload failed due to network issue. Please try again.'
+          })
+        }
+      } else {
+        // This appears to be an actual processing error
+        updateDocumentState({
+          status: 'error',
+          progress: 0,
+          message: errorMessage.includes('Processing failed') ? 
+            'Document processing failed. Please check the document format and try again.' : 
+            errorMessage
+        })
+      }
     }
   }
 
   // Fallback polling function to get final document status
   const pollDocumentStatus = async (documentId: string, index: number, updateDocumentState: (updates: Partial<ProcessedDocument>) => void) => {
-    const maxAttempts = 30 // 30 seconds max
+    const maxAttempts = 60 // 60 seconds max - give more time for processing
     let attempts = 0
+    let consecutiveErrors = 0
+    const maxConsecutiveErrors = 5
     
     const poll = async () => {
       try {
+        console.log(`🔍 [FALLBACK POLL] Checking document status for ${documentId} (attempt ${attempts + 1}/${maxAttempts})`)
         const response = await fetch(`/api/documents/${documentId}`)
+        
         if (response.ok) {
           const document = await response.json()
+          consecutiveErrors = 0 // Reset error counter on successful response
+          
+          console.log(`📊 [FALLBACK POLL] Document status: ${document.processingStatus}`)
           
           if (document.processingStatus === 'COMPLETED') {
+            console.log(`✅ [FALLBACK POLL] Document processing completed successfully`)
             updateDocumentState({
               status: 'completed',
               progress: 100,
@@ -418,6 +457,7 @@ export function DocumentProcessor({
             }
             return true
           } else if (document.processingStatus === 'FAILED') {
+            console.log(`❌ [FALLBACK POLL] Document processing failed`)
             updateDocumentState({
               status: 'error',
               progress: 0,
@@ -426,30 +466,61 @@ export function DocumentProcessor({
             return true
           } else if (document.processingStatus === 'PROCESSING' && attempts < maxAttempts) {
             // Still processing, continue polling
+            console.log(`⏳ [FALLBACK POLL] Still processing, continuing to poll...`)
+            updateDocumentState({
+              status: 'processing',
+              progress: Math.min(90, 50 + (attempts * 2)), // Gradually increase progress
+              message: `Processing document... (${attempts + 1}/${maxAttempts})`
+            })
             attempts++
-            setTimeout(poll, 1000)
+            setTimeout(poll, 2000) // Poll every 2 seconds
             return false
           } else {
-            // Timeout or unknown status
+            // Timeout reached
+            console.warn(`⚠️ [FALLBACK POLL] Polling timeout reached after ${attempts + 1} attempts`)
             updateDocumentState({
               status: 'error',
               progress: 0,
-              message: 'Processing timeout - please try again'
+              message: `Processing timeout after ${attempts + 1} attempts. Please refresh the page or try again.`
             })
             return true
           }
+        } else {
+          console.warn(`⚠️ [FALLBACK POLL] API response error: ${response.status} ${response.statusText}`)
+          consecutiveErrors++
+          throw new Error(`API response error: ${response.status}`)
         }
       } catch (error) {
-        console.error('Polling error:', error)
-        if (attempts < maxAttempts) {
-          attempts++
-          setTimeout(poll, 1000)
-        } else {
+        console.error(`❌ [FALLBACK POLL] Error during polling:`, error)
+        consecutiveErrors++
+        
+        if (consecutiveErrors >= maxConsecutiveErrors) {
+          console.error(`❌ [FALLBACK POLL] Too many consecutive errors, stopping polling`)
           updateDocumentState({
             status: 'error',
             progress: 0,
-            message: 'Failed to get processing status'
+            message: 'Unable to check processing status due to connection issues. Please refresh the page.'
           })
+          return true
+        }
+        
+        if (attempts < maxAttempts) {
+          attempts++
+          updateDocumentState({
+            status: 'processing',
+            progress: Math.min(90, 50 + (attempts * 2)),
+            message: `Checking processing status... (${attempts}/${maxAttempts})`
+          })
+          setTimeout(poll, 3000) // Wait longer on errors
+          return false
+        } else {
+          console.error(`❌ [FALLBACK POLL] Max attempts reached with errors`)
+          updateDocumentState({
+            status: 'error',
+            progress: 0,
+            message: 'Failed to check processing status. Please refresh the page or try again.'
+          })
+          return true
         }
       }
     }
