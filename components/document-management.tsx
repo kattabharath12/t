@@ -67,8 +67,9 @@ export function DocumentManagement({ taxReturnId, onDocumentProcessed }: Documen
           setDocuments(data)
         } else if (data.length === 0 && documents.length > 0) {
           // If API returns empty array but we had documents before, this might be a temporary issue
-          // Keep existing documents to prevent UI flashing
+          // Keep existing documents to prevent UI flashing - ACTUALLY preserve state by returning early
           console.warn('⚠️ API returned empty documents array, preserving existing documents to prevent UI flashing')
+          return // EXIT EARLY to preserve existing state
         }
         
         // Trigger callback for processed documents
@@ -133,7 +134,7 @@ export function DocumentManagement({ taxReturnId, onDocumentProcessed }: Documen
             return
           }
           
-          // More generous polling criteria - continue if processing docs, recent docs, or empty state
+          // More generous polling criteria - continue if processing docs, recent docs, or during initial load
           const hasProcessingDocs = documents.some(doc => doc.processingStatus === 'PROCESSING')
           const hasRecentDocs = documents.some(doc => {
             const updatedTime = new Date(doc.updatedAt).getTime()
@@ -141,14 +142,18 @@ export function DocumentManagement({ taxReturnId, onDocumentProcessed }: Documen
             return (now - updatedTime) < 180000 // 3 minutes for better coverage - further extended
           })
           
-          // Also continue polling for a bit if documents array is empty but we recently had documents
-          // This helps handle temporary API failures
-          const shouldContinuePolling = hasProcessingDocs || hasRecentDocs || documents.length === 0
+          // Only continue polling for empty state during initial load phase (first 2 minutes)
+          // This prevents infinite polling when legitimately no documents exist
+          const isInitialLoadPhase = (Date.now() - pollStartTime) < 120000 // 2 minutes
+          const shouldPollForEmptyState = documents.length === 0 && isInitialLoadPhase
+          
+          const shouldContinuePolling = hasProcessingDocs || hasRecentDocs || shouldPollForEmptyState
           
           const pollDurationSeconds = Math.round((Date.now() - pollStartTime) / 1000)
           console.log('🔄 Polling check:', { 
             hasProcessingDocs, 
-            hasRecentDocs, 
+            hasRecentDocs,
+            shouldPollForEmptyState,
             documentsCount: documents.length,
             shouldContinuePolling,
             pollDuration: `${Math.floor(pollDurationSeconds / 60)}m ${pollDurationSeconds % 60}s`,
@@ -161,6 +166,13 @@ export function DocumentManagement({ taxReturnId, onDocumentProcessed }: Documen
           } else {
             // No need to poll anymore, all documents are in final states
             console.log('✅ Stopping polling - all documents in stable state')
+            
+            // Final state validation: Check if we have any documents that are genuinely failed
+            const failedDocs = documents.filter(doc => doc.processingStatus === 'FAILED')
+            if (failedDocs.length > 0) {
+              console.warn('⚠️ Some documents failed processing:', failedDocs.map(doc => doc.id))
+            }
+            
             if (interval) {
               clearInterval(interval)
               interval = null
@@ -181,12 +193,15 @@ export function DocumentManagement({ taxReturnId, onDocumentProcessed }: Documen
       return (now - updatedTime) < 120000 // 2 minutes - further extended for better coverage
     })
     
-    // Start polling if we have processing docs, recent activity, or no documents (initial state)
-    if (hasProcessingDocs || hasRecentActivity || documents.length === 0) {
+    // Start polling if we have processing docs, recent activity, or initial empty state
+    const shouldStartPolling = hasProcessingDocs || hasRecentActivity || (documents.length === 0 && loading)
+    
+    if (shouldStartPolling) {
       console.log('🚀 Starting document polling...', { 
         hasProcessingDocs, 
         hasRecentActivity, 
         documentsLength: documents.length,
+        isInitialLoad: loading,
         maxPollDurationMinutes: Math.round(maxPollDuration / 60000)
       })
       pollStartTime = Date.now()
@@ -465,3 +480,4 @@ export function DocumentManagement({ taxReturnId, onDocumentProcessed }: Documen
     </div>
   )
 }
+
