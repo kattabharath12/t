@@ -62,13 +62,13 @@ export function DocumentManagement({ taxReturnId, onDocumentProcessed }: Documen
           total: data.length 
         })
         
-        // Only update documents state if we got valid data or if this is the first successful fetch
-        if (data.length > 0 || documents.length === 0) {
+        // State preservation strategy: Only update if we get valid data OR this is the first successful fetch
+        if (data.length > 0 || documents.length === 0 || retryCount === 0) {
           setDocuments(data)
         } else if (data.length === 0 && documents.length > 0) {
           // If API returns empty array but we had documents before, this might be a temporary issue
-          // Don't clear the documents state, just log it
-          console.warn('⚠️ API returned empty documents array, keeping existing documents')
+          // Keep existing documents to prevent UI flashing
+          console.warn('⚠️ API returned empty documents array, preserving existing documents to prevent UI flashing')
         }
         
         // Trigger callback for processed documents
@@ -83,18 +83,18 @@ export function DocumentManagement({ taxReturnId, onDocumentProcessed }: Documen
         console.error('❌ Failed to fetch documents:', response.status, response.statusText)
         // Only retry a few times to avoid infinite loops
         if (retryCount < 3) {
-          console.log('🔄 Retrying fetch in 3 seconds...', `(retry ${retryCount + 1}/3)`)
-          setTimeout(() => fetchDocuments(retryCount + 1), 3000)
+          console.log('🔄 Retrying fetch in 5 seconds...', `(retry ${retryCount + 1}/3)`)
+          setTimeout(() => fetchDocuments(retryCount + 1), 5000)
         } else {
           console.error('❌ Max retries reached for fetching documents')
         }
       }
     } catch (error) {
       console.error("❌ Error fetching documents:", error)
-      // Only retry a few times to avoid infinite loops
+      // Only retry a few times to avoid infinite loops  
       if (retryCount < 3) {
-        console.log('🔄 Retrying fetch due to error in 3 seconds...', `(retry ${retryCount + 1}/3)`)
-        setTimeout(() => fetchDocuments(retryCount + 1), 3000)
+        console.log('🔄 Retrying fetch due to error in 5 seconds...', `(retry ${retryCount + 1}/3)`)
+        setTimeout(() => fetchDocuments(retryCount + 1), 5000)
       } else {
         console.error('❌ Max retries reached for fetching documents due to error')
       }
@@ -110,11 +110,11 @@ export function DocumentManagement({ taxReturnId, onDocumentProcessed }: Documen
     fetchDocuments()
   }, [fetchDocuments])
 
-  // Enhanced polling logic - more robust with better error handling
+  // Enhanced polling logic - more robust with better error handling and longer duration
   useEffect(() => {
     let interval: NodeJS.Timeout | null = null
     let pollStartTime = Date.now()
-    const maxPollDuration = 5 * 60 * 1000 // 5 minutes max polling
+    const maxPollDuration = 12 * 60 * 1000 // 12 minutes max polling - extended for very complex Azure DI processing
     
     const startPolling = () => {
       if (interval) clearInterval(interval)
@@ -122,8 +122,10 @@ export function DocumentManagement({ taxReturnId, onDocumentProcessed }: Documen
       interval = setInterval(async () => {
         try {
           // Check if we've been polling too long
-          if (Date.now() - pollStartTime > maxPollDuration) {
-            console.log('🛑 Stopping polling after max duration reached')
+          const pollDurationMs = Date.now() - pollStartTime
+          if (pollDurationMs > maxPollDuration) {
+            const pollDurationMinutes = Math.round(pollDurationMs / 60000)
+            console.log(`🛑 Stopping polling after max duration reached (${pollDurationMinutes} minutes)`)
             if (interval) {
               clearInterval(interval)
               interval = null
@@ -131,24 +133,25 @@ export function DocumentManagement({ taxReturnId, onDocumentProcessed }: Documen
             return
           }
           
-          // Poll if there are documents in processing state OR if we have recent documents (within 60 seconds)
+          // More generous polling criteria - continue if processing docs, recent docs, or empty state
           const hasProcessingDocs = documents.some(doc => doc.processingStatus === 'PROCESSING')
           const hasRecentDocs = documents.some(doc => {
             const updatedTime = new Date(doc.updatedAt).getTime()
             const now = new Date().getTime()
-            return (now - updatedTime) < 60000 // 60 seconds for better coverage
+            return (now - updatedTime) < 180000 // 3 minutes for better coverage - further extended
           })
           
           // Also continue polling for a bit if documents array is empty but we recently had documents
           // This helps handle temporary API failures
           const shouldContinuePolling = hasProcessingDocs || hasRecentDocs || documents.length === 0
           
+          const pollDurationSeconds = Math.round((Date.now() - pollStartTime) / 1000)
           console.log('🔄 Polling check:', { 
             hasProcessingDocs, 
             hasRecentDocs, 
             documentsCount: documents.length,
             shouldContinuePolling,
-            pollDuration: Math.round((Date.now() - pollStartTime) / 1000) + 's',
+            pollDuration: `${Math.floor(pollDurationSeconds / 60)}m ${pollDurationSeconds % 60}s`,
             timestamp: new Date().toISOString()
           })
           
@@ -165,17 +168,17 @@ export function DocumentManagement({ taxReturnId, onDocumentProcessed }: Documen
           }
         } catch (error) {
           console.error('❌ Polling error:', error)
-          // Don't stop polling on error, just log it
+          // Don't stop polling on error, just log it and continue - this ensures robustness
         }
-      }, 3000) // Poll every 3 seconds for more stable updates
+      }, 3000) // Poll every 3 seconds for stable updates
     }
 
-    // Determine if we should start polling
+    // More lenient criteria for starting polling - extended timeframes
     const hasProcessingDocs = documents.some(doc => doc.processingStatus === 'PROCESSING')
     const hasRecentActivity = documents.some(doc => {
       const updatedTime = new Date(doc.updatedAt).getTime()
       const now = new Date().getTime()
-      return (now - updatedTime) < 30000 // 30 seconds
+      return (now - updatedTime) < 120000 // 2 minutes - further extended for better coverage
     })
     
     // Start polling if we have processing docs, recent activity, or no documents (initial state)
@@ -183,7 +186,8 @@ export function DocumentManagement({ taxReturnId, onDocumentProcessed }: Documen
       console.log('🚀 Starting document polling...', { 
         hasProcessingDocs, 
         hasRecentActivity, 
-        documentsLength: documents.length 
+        documentsLength: documents.length,
+        maxPollDurationMinutes: Math.round(maxPollDuration / 60000)
       })
       pollStartTime = Date.now()
       startPolling()
@@ -461,4 +465,3 @@ export function DocumentManagement({ taxReturnId, onDocumentProcessed }: Documen
     </div>
   )
 }
-
