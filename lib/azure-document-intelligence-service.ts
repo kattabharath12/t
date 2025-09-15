@@ -287,9 +287,9 @@ export class AzureDocumentIntelligenceService {
       }
     }
     
-    // OCR fallback for personal info if not found in structured fields
+    // ENHANCED OCR fallback for personal info if not found in structured fields
     if ((!w2Data.employeeName || !w2Data.employeeSSN || !w2Data.employeeAddress || !w2Data.employerName || !w2Data.employerAddress) && baseData.fullText) {
-      console.log('🔍 [Azure DI] Some personal info missing from structured fields, attempting OCR extraction...');
+      console.log('🔍 [Azure DI] Some personal info missing from structured fields, attempting enhanced OCR extraction...');
       
       // Pass the already extracted employee name as a target for multi-employee scenarios
       const targetEmployeeName = w2Data.employeeName as string | undefined;
@@ -318,6 +318,14 @@ export class AzureDocumentIntelligenceService {
       if (!w2Data.employerAddress && personalInfoFromOCR.employerAddress) {
         w2Data.employerAddress = personalInfoFromOCR.employerAddress;
         console.log('✅ [Azure DI] Extracted employer address from OCR:', w2Data.employerAddress);
+      }
+    } else if (baseData.fullText && !w2Data.employeeName) {
+      // CRITICAL FIX: Always try OCR extraction for employee name if it's missing
+      console.log('🔍 [Azure DI] CRITICAL: Employee name missing, forcing OCR extraction...');
+      const personalInfoFromOCR = this.extractPersonalInfoFromOCR(baseData.fullText as string);
+      if (personalInfoFromOCR.name) {
+        w2Data.employeeName = personalInfoFromOCR.name;
+        console.log('✅ [Azure DI] Force-extracted employee name from OCR:', w2Data.employeeName);
       }
     }
 
@@ -428,9 +436,9 @@ export class AzureDocumentIntelligenceService {
       }
     }
     
-    // OCR fallback for personal info if not found in structured fields
+    // ENHANCED OCR fallback for personal info if not found in structured fields
     if ((!data.recipientName || !data.recipientTIN || !data.recipientAddress || !data.payerName || !data.payerTIN) && baseData.fullText) {
-      console.log('🔍 [Azure DI] Some 1099 info missing from structured fields, attempting OCR extraction...');
+      console.log('🔍 [Azure DI] Some 1099 info missing from structured fields, attempting enhanced OCR extraction...');
       const personalInfoFromOCR = this.extractPersonalInfoFromOCR(baseData.fullText as string);
       
       if (!data.recipientName && personalInfoFromOCR.name) {
@@ -456,6 +464,14 @@ export class AzureDocumentIntelligenceService {
       if (!data.payerTIN && personalInfoFromOCR.payerTIN) {
         data.payerTIN = personalInfoFromOCR.payerTIN;
         console.log('✅ [Azure DI] Extracted payer TIN from OCR:', data.payerTIN);
+      }
+    } else if (baseData.fullText && !data.recipientName) {
+      // CRITICAL FIX: Always try OCR extraction for recipient name if it's missing
+      console.log('🔍 [Azure DI] CRITICAL: Recipient name missing from 1099, forcing OCR extraction...');
+      const personalInfoFromOCR = this.extractPersonalInfoFromOCR(baseData.fullText as string);
+      if (personalInfoFromOCR.name) {
+        data.recipientName = personalInfoFromOCR.name;
+        console.log('✅ [Azure DI] Force-extracted recipient name from OCR:', data.recipientName);
       }
     }
     
