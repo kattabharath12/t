@@ -45,9 +45,9 @@ export function DocumentManagement({ taxReturnId, onDocumentProcessed }: Documen
   const [loading, setLoading] = useState(true)
   const [selectedDocument, setSelectedDocument] = useState<Document | null>(null)
 
-  const fetchDocuments = useCallback(async () => {
+  const fetchDocuments = useCallback(async (retryCount = 0) => {
     try {
-      console.log('🔍 Fetching documents for taxReturnId:', taxReturnId)
+      console.log('🔍 Fetching documents for taxReturnId:', taxReturnId, `(attempt ${retryCount + 1})`)
       const response = await fetch(`/api/tax-returns/${taxReturnId}/documents`)
       if (response.ok) {
         const data = await response.json()
@@ -62,7 +62,14 @@ export function DocumentManagement({ taxReturnId, onDocumentProcessed }: Documen
           total: data.length 
         })
         
-        setDocuments(data)
+        // Only update documents state if we got valid data or if this is the first successful fetch
+        if (data.length > 0 || documents.length === 0) {
+          setDocuments(data)
+        } else if (data.length === 0 && documents.length > 0) {
+          // If API returns empty array but we had documents before, this might be a temporary issue
+          // Don't clear the documents state, just log it
+          console.warn('⚠️ API returned empty documents array, keeping existing documents')
+        }
         
         // Trigger callback for processed documents
         if (onDocumentProcessed && completedDocs.length > 0) {
@@ -74,70 +81,122 @@ export function DocumentManagement({ taxReturnId, onDocumentProcessed }: Documen
         }
       } else {
         console.error('❌ Failed to fetch documents:', response.status, response.statusText)
-        // Retry after a delay on failure
-        setTimeout(() => fetchDocuments(), 5000)
+        // Only retry a few times to avoid infinite loops
+        if (retryCount < 3) {
+          console.log('🔄 Retrying fetch in 3 seconds...', `(retry ${retryCount + 1}/3)`)
+          setTimeout(() => fetchDocuments(retryCount + 1), 3000)
+        } else {
+          console.error('❌ Max retries reached for fetching documents')
+        }
       }
     } catch (error) {
       console.error("❌ Error fetching documents:", error)
-      // Retry after a delay on error
-      setTimeout(() => fetchDocuments(), 5000)
+      // Only retry a few times to avoid infinite loops
+      if (retryCount < 3) {
+        console.log('🔄 Retrying fetch due to error in 3 seconds...', `(retry ${retryCount + 1}/3)`)
+        setTimeout(() => fetchDocuments(retryCount + 1), 3000)
+      } else {
+        console.error('❌ Max retries reached for fetching documents due to error')
+      }
     } finally {
-      setLoading(false)
+      // Only set loading to false on the first attempt
+      if (retryCount === 0) {
+        setLoading(false)
+      }
     }
-  }, [taxReturnId, onDocumentProcessed])
+  }, [taxReturnId, onDocumentProcessed, documents.length])
 
   useEffect(() => {
     fetchDocuments()
   }, [fetchDocuments])
 
-  // Enhanced polling logic - poll more frequently and for longer
+  // Enhanced polling logic - more robust with better error handling
   useEffect(() => {
     let interval: NodeJS.Timeout | null = null
+    let pollStartTime = Date.now()
+    const maxPollDuration = 5 * 60 * 1000 // 5 minutes max polling
     
     const startPolling = () => {
       if (interval) clearInterval(interval)
       
       interval = setInterval(async () => {
         try {
-          // Poll if there are documents in processing state OR if we have recent documents (within 30 seconds)
+          // Check if we've been polling too long
+          if (Date.now() - pollStartTime > maxPollDuration) {
+            console.log('🛑 Stopping polling after max duration reached')
+            if (interval) {
+              clearInterval(interval)
+              interval = null
+            }
+            return
+          }
+          
+          // Poll if there are documents in processing state OR if we have recent documents (within 60 seconds)
           const hasProcessingDocs = documents.some(doc => doc.processingStatus === 'PROCESSING')
           const hasRecentDocs = documents.some(doc => {
             const updatedTime = new Date(doc.updatedAt).getTime()
             const now = new Date().getTime()
-            return (now - updatedTime) < 30000 // 30 seconds
+            return (now - updatedTime) < 60000 // 60 seconds for better coverage
           })
+          
+          // Also continue polling for a bit if documents array is empty but we recently had documents
+          // This helps handle temporary API failures
+          const shouldContinuePolling = hasProcessingDocs || hasRecentDocs || documents.length === 0
           
           console.log('🔄 Polling check:', { 
             hasProcessingDocs, 
             hasRecentDocs, 
             documentsCount: documents.length,
+            shouldContinuePolling,
+            pollDuration: Math.round((Date.now() - pollStartTime) / 1000) + 's',
             timestamp: new Date().toISOString()
           })
           
-          if (hasProcessingDocs || hasRecentDocs) {
-            console.log('📡 Fetching documents due to processing status or recent activity...')
+          if (shouldContinuePolling) {
+            console.log('📡 Fetching documents due to active processing or recent activity...')
             await fetchDocuments()
+          } else {
+            // No need to poll anymore, all documents are in final states
+            console.log('✅ Stopping polling - all documents in stable state')
+            if (interval) {
+              clearInterval(interval)
+              interval = null
+            }
           }
         } catch (error) {
           console.error('❌ Polling error:', error)
+          // Don't stop polling on error, just log it
         }
-      }, 2000) // Poll every 2 seconds for faster updates
+      }, 3000) // Poll every 3 seconds for more stable updates
     }
 
-    // Start polling immediately if there are processing documents
+    // Determine if we should start polling
     const hasProcessingDocs = documents.some(doc => doc.processingStatus === 'PROCESSING')
-    if (hasProcessingDocs || documents.length === 0) {
+    const hasRecentActivity = documents.some(doc => {
+      const updatedTime = new Date(doc.updatedAt).getTime()
+      const now = new Date().getTime()
+      return (now - updatedTime) < 30000 // 30 seconds
+    })
+    
+    // Start polling if we have processing docs, recent activity, or no documents (initial state)
+    if (hasProcessingDocs || hasRecentActivity || documents.length === 0) {
+      console.log('🚀 Starting document polling...', { 
+        hasProcessingDocs, 
+        hasRecentActivity, 
+        documentsLength: documents.length 
+      })
+      pollStartTime = Date.now()
       startPolling()
     }
 
     return () => {
-      console.log('🛑 Clearing polling interval')
+      console.log('🛑 Cleaning up polling interval')
       if (interval) {
         clearInterval(interval)
         interval = null
       }
     }
-  }, [documents.length, documents.some(doc => doc.processingStatus === 'PROCESSING')])
+  }, [documents.length, documents.map(doc => `${doc.id}-${doc.processingStatus}-${doc.updatedAt}`).join('|'), fetchDocuments])
 
   const handleDeleteDocument = async (documentId: string) => {
     try {
